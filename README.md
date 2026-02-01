@@ -7,7 +7,6 @@ https://github.com/sofa-framework/sofa/blob/master/applications/plugins/Articula
 
 
 
-
 # Use this command to run robot.py
 
 $RUN_SOFA -l SofaPython3 -l SofaAssimp -l ArticulatedSystemPlugin robot.py

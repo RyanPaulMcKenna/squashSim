@@ -82,7 +82,8 @@ class RobotGUI(Sofa.Core.Controller):
                 ]
 
         angles = numpy.array(angles)
-        self.robot.angles = angles.tolist()
+        # self.robot.angles = angles.tolist()
+        self.robot.getData('angles').value = angles.tolist()
 
         return
     

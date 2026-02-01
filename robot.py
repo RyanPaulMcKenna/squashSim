@@ -63,6 +63,16 @@ collisionTranslations = {
     "wrist_3_link":      (0, 0, 0.01)
 }
 
+collisionTranslations_zero = {
+    "base_link_inertia": (0, 0, 0),
+    "shoulder_link":     (0, 0, 0),
+    "upper_arm_link":    (0, 0, 0),
+    "forearm_link":      (0, 0, 0),
+    "wrist_1_link":      (0, 0, 0),
+    "wrist_2_link":      (0, 0, 0),
+    "wrist_3_link":      (0, 0, 0)
+}
+
 GRIPPER_MESH_ROOT = '/home/ryanm/ur5_rg2_ign/ur5_rg2/meshes/' # dae /visual/rg2, stl /collision/rg2
 # ----------------------------------------------
 
@@ -235,7 +245,7 @@ class Robot:
 
 
         # You can change the joint angles here
-        initAngles = [0, 0, 0, 0, 0, 0, 0] # add for more dofs to control.
+        initAngles = [0, 0, 0, 0, 0, 0] # add for more dofs to control.
 
         robotNode.addData('angles', initAngles, None, 'angle of articulations in radian', '', 'vector<float>')
         robotNode.addObject('EulerImplicitSolver')
@@ -270,7 +280,7 @@ class Robot:
         addPart(parts, 'Part4', 4, visual_wrist1Path, collision_wrist1Path)
         addPart(parts, 'Part5', 5, visual_wrist2Path, collision_wrist2Path)
         addPart(parts, 'Part6', 6, visual_wrist3Path, collision_wrist3Path)
-        addPart(parts, 'Part7', 7, rg2HandVisualPath, rg2HandCollisPath)
+        # addPart(parts, 'Part7', 7, rg2HandVisualPath, rg2HandCollisPath)
 
 
 
@@ -282,7 +292,7 @@ class Robot:
         addCenter(centers, 'CenterPart3', 3, 4, [0, 0.3922, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 3)
         addCenter(centers, 'CenterPart4', 4, 5, [0, 0, 0.1333-0.007], [0, 0, 0], 0, 0, 1, [0, 1, 0], 4)
         addCenter(centers, 'CenterPart5', 5, 6, [0, 0.0997, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 5)
-        addCenter(centers, 'CenterPart5', 6, 7, [0, 0.425, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 6) # hand to wist3
+        # addCenter(centers, 'CenterPart5', 6, 7, [0, 0.425, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 6) # hand to wist3
 
         #0 0 -0.0989
         return robotNode

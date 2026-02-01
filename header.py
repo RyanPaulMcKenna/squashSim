@@ -36,7 +36,7 @@ def addHeader(rootNode):
     rootNode.addObject('CollisionPipeline')
     rootNode.addObject('ParallelBruteForceBroadPhase')
     rootNode.addObject('ParallelBVHNarrowPhase')
-    rootNode.addObject('NewProximityIntersection', alarmDistance='0.0015', contactDistance='0.0005')
+    rootNode.addObject('NewProximityIntersection', alarmDistance='0.0008', contactDistance='0.0003')
     rootNode.addObject('CollisionResponse', name='ContactManager', response='FrictionContactConstraint', responseParams='mu=0.25')
 
 
