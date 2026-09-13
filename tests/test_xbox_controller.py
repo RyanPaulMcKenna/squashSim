@@ -96,6 +96,22 @@ class XboxControlStateTests(unittest.TestCase):
         self.assertEqual(update.command_delta, 0.0)
         self.assertFalse(state.connected)
 
+    def test_a_button_emits_one_recording_toggle_per_press(self):
+        state = XboxControlState()
+
+        self.assertTrue(
+            state.step(connected_sample(a_button=True), 0.01).recording_toggle
+        )
+        self.assertFalse(
+            state.step(connected_sample(a_button=True), 0.01).recording_toggle
+        )
+        self.assertFalse(
+            state.step(connected_sample(a_button=False), 0.01).recording_toggle
+        )
+        self.assertTrue(
+            state.step(connected_sample(a_button=True), 0.01).recording_toggle
+        )
+
 
 class _FakeDisplay:
     def __init__(self):
@@ -130,8 +146,8 @@ class _FakeController:
     def __init__(self):
         self.is_attached = True
         self.closed = False
-        self.axes = {0: -16384, 4: 8192, 5: 24576}
-        self.buttons = {9: True, 10: False}
+        self.axes = {0: -16384, 2: 16384, 3: -8192, 4: 8192, 5: 24576}
+        self.buttons = {0: True, 9: True, 10: False}
 
     def attached(self):
         return self.is_attached
@@ -185,10 +201,13 @@ class PygameBackendTests(unittest.TestCase):
         self.assertTrue(sample.connected)
         self.assertEqual(sample.name, "Test Xbox Pad")
         self.assertAlmostEqual(sample.left_x, -0.5)
+        self.assertAlmostEqual(sample.right_x, 16384.0 / 32767.0)
+        self.assertAlmostEqual(sample.right_y, -0.25)
         self.assertAlmostEqual(sample.left_trigger, 0.25)
         self.assertAlmostEqual(sample.right_trigger, 0.75)
         self.assertTrue(sample.left_bumper)
         self.assertFalse(sample.right_bumper)
+        self.assertTrue(sample.a_button)
         self.assertEqual(pygame.event.pumps, 1)
         self.assertEqual(pygame.event.clears, 1)
 

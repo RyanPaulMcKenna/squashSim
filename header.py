@@ -1,3 +1,25 @@
+import os
+
+
+def _positive_environment_float(name, default):
+    value = float(os.environ.get(name, default))
+    if value <= 0.0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+# 10 ms halves the number of physics solves per simulated second compared with
+# the previous 5 ms scene while remaining conservative for the implicit cable
+# solver. Both values can be tuned at launch without editing the demonstration.
+SIMULATION_TIMESTEP = _positive_environment_float("SQUASHSIM_DT", "0.01")
+CONTACT_FRICTION = _positive_environment_float(
+    "SQUASHSIM_FRICTION", "0.8"
+)
+CONFIGURED_SOFA_VERSION = os.environ.get(
+    "SQUASHSIM_SOFA_VERSION", "25.06.00"
+)
+
+
 def addHeader(rootNode):
 
     rootNode.addObject("RequiredPlugin", name="Sofa.Component.StateContainer")              # MechanicalObject
@@ -39,13 +61,25 @@ def addHeader(rootNode):
     rootNode.addObject('ParallelBruteForceBroadPhase')
     rootNode.addObject('ParallelBVHNarrowPhase')
     rootNode.addObject('NewProximityIntersection', alarmDistance='0.003', contactDistance='0.001')
-    rootNode.addObject('CollisionResponse', name='ContactManager', response='FrictionContactConstraint', responseParams='mu=0.25')
+    rootNode.addObject(
+        'CollisionResponse',
+        name='ContactManager',
+        response='FrictionContactConstraint',
+        responseParams=f'mu={CONTACT_FRICTION:.6g}',
+    )
 
 
     rootNode.addObject("VisualStyle", displayFlags="showVisualModels hideMappings")
     rootNode.addObject('BackgroundSetting', color=[1., 1., 1., 1.])
-    rootNode.findData('dt').value=0.005
+    rootNode.findData('dt').value = SIMULATION_TIMESTEP
     rootNode.gravity = [0,-9.810,0]
+
+    print(
+        "[squashSim] simulation: "
+        f"dt={SIMULATION_TIMESTEP:.4f} s "
+        f"({1.0 / SIMULATION_TIMESTEP:.1f} Hz nominal), "
+        f"contact friction mu={CONTACT_FRICTION:.3g}"
+    )
 
     # rootNode.addObject('ContactListener', name='contacts', listening='1')  # logs contacts
 

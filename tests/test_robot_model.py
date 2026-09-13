@@ -196,12 +196,10 @@ class RobotModelTests(unittest.TestCase):
         self.assertEqual(
             len(articulations.Rigid.dofs.parameters["position"]), 9
         )
-        fixed_base = articulations.Rigid.fixedBase
-        self.assertEqual(
-            fixed_base.component_type, "FixedProjectiveConstraint"
-        )
-        self.assertEqual(fixed_base.parameters["template"], "Rigid3d")
-        self.assertEqual(fixed_base.parameters["indices"], [0])
+        # Rigid/dofs is the mapped output of ArticulatedSystemMapping. Applying
+        # a projective constraint to that mapped state causes MappingGraph
+        # errors; the articulation root itself defines the fixed base frame.
+        self.assertFalse(hasattr(articulations.Rigid, "fixedBase"))
 
         center_nodes = articulations.ArticulationCenters.children
         self.assertEqual(len(center_nodes), 8)
@@ -267,7 +265,7 @@ class RobotModelTests(unittest.TestCase):
         self.assertEqual(len(collision.topology.parameters["triangles"]), 2)
         self.assertFalse(collision.model.parameters["moving"])
         self.assertFalse(collision.model.parameters["simulated"])
-        self.assertEqual(collision.model.parameters["group"], [1])
+        self.assertEqual(collision.model.parameters["group"], [2])
 
         visual = floor.Visual.model
         self.assertEqual(len(visual.parameters["position"]), 8)
@@ -284,6 +282,31 @@ class RobotModelTests(unittest.TestCase):
             ]
             self.assertLessEqual(
                 len(states), 1, f"multiple BaseStates in {node.path}: {states}"
+            )
+
+    def test_camera_and_contact_recording_scene_graph(self):
+        import flexible_cable
+
+        root = FakeNode()
+        camera = self.robot.add_scene_camera(root)
+        floor = self.robot.add_floor(root)
+        robot_node = self.robot.Robot(root).addRobot()
+        cable = flexible_cable.add_flexible_cable(root)
+        listeners = self.robot.add_demo_contact_listeners(
+            root, robot_node, floor, cable
+        )
+
+        self.assertEqual(camera.component_type, "InteractiveCamera")
+        self.assertEqual(camera.parameters["position"], self.robot.CAMERA_POSITION)
+        self.assertEqual(camera.parameters["lookAt"], self.robot.CAMERA_LOOK_AT)
+        self.assertTrue(camera.parameters["fixedLookAt"])
+        self.assertEqual(len(listeners["gripper"]), 3)
+        self.assertEqual(len(listeners["floor"]), 1)
+        for listener in (*listeners["gripper"], *listeners["floor"]):
+            self.assertEqual(listener.component_type, "ContactListener")
+            self.assertEqual(
+                listener.parameters["collisionModel2"],
+                cable.collisionModel.getLinkPath(),
             )
 
     def test_sofa_articulation_matches_urdf_forward_kinematics(self):

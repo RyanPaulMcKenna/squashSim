@@ -15,7 +15,14 @@ import numpy as np
 import Sofa.Simulation as Sim
 from scipy.spatial.transform import Rotation
 
-from demo_object import add_demo_object
+from demo_object import add_demo_object, selected_object_name
+from flexible_cable import (
+    CABLE_GRASP_INDEX,
+    CABLE_LENGTH,
+    CABLE_MASS,
+    CABLE_NODE_COUNT,
+    CABLE_RADIUS,
+)
 from robotGUI import RobotGUI
 
 
@@ -56,6 +63,7 @@ PART_NAMES = RIGID_LINK_NAMES[:7] + (
     "rg2_leftfinger",
     "rg2_rightfinger",
 )
+GRIPPER_PART_NAMES = ("rg2_hand", "rg2_leftfinger", "rg2_rightfinger")
 
 # Convert the reference model's Z-up coordinates into SOFA's Y-up world with
 # a proper right-handed -90 degree rotation around X.
@@ -81,6 +89,8 @@ FLOOR_TOP_Y = -0.003
 FLOOR_HALF_EXTENT = 1.2
 FLOOR_THICKNESS = 0.03
 FLOOR_COLOR = [0.34, 0.37, 0.41, 1.0]
+CAMERA_POSITION = [1.35, 0.95, 1.35]
+CAMERA_LOOK_AT = [0.18, 0.30, 0.10]
 
 
 @dataclass(frozen=True)
@@ -719,6 +729,71 @@ def add_floor(root_node, name="Floor"):
     return floor
 
 
+def add_scene_camera(root_node):
+    """Add the camera used by both the mouse and the Xbox right stick."""
+    return root_node.addObject(
+        "InteractiveCamera",
+        name="camera",
+        position=CAMERA_POSITION,
+        lookAt=CAMERA_LOOK_AT,
+        fixedLookAt=True,
+        activated=True,
+        listening=True,
+        fieldOfView=45.0,
+        zNear=0.01,
+        zFar=20.0,
+    )
+
+
+def _demo_object_collision_model(demo_object):
+    if demo_object is None:
+        return None
+    collision_model = demo_object.getObject("collisionModel")
+    if collision_model is not None:
+        return collision_model
+    surface = getattr(demo_object, "Surface", None)
+    if surface is not None:
+        return surface.getObject("collisionModel")
+    return None
+
+
+def add_demo_contact_listeners(root_node, robot_node, floor, demo_object):
+    """Observe RG2/object and floor/object contacts without changing physics."""
+    object_collision = _demo_object_collision_model(demo_object)
+    if object_collision is None:
+        return {"gripper": (), "floor": ()}
+
+    object_path = object_collision.getLinkPath()
+    parts = robot_node.Articulations.Rigid.Parts
+    gripper_listeners = []
+    for part_name in GRIPPER_PART_NAMES:
+        robot_collision = getattr(parts, part_name).Collision.getObject("model")
+        gripper_listeners.append(
+            root_node.addObject(
+                "ContactListener",
+                name=f"{part_name}ObjectContacts",
+                collisionModel1=robot_collision.getLinkPath(),
+                collisionModel2=object_path,
+            )
+        )
+
+    floor_collision = floor.Collision.getObject("model")
+    floor_listener = root_node.addObject(
+        "ContactListener",
+        name="floorObjectContacts",
+        collisionModel1=floor_collision.getLinkPath(),
+        collisionModel2=object_path,
+    )
+    print(
+        "[squashSim] contact recording: RG2 hand/two fingers and floor "
+        "against the selected object"
+    )
+    return {
+        "gripper": tuple(gripper_listeners),
+        "floor": (floor_listener,),
+    }
+
+
 def articulation_definitions():
     """Return all eight centres derived from the reference URDF."""
     definitions = []
@@ -861,23 +936,91 @@ class Robot:
 
 
 def createScene(rootNode):
-    from header import addHeader
+    from header import (
+        CONFIGURED_SOFA_VERSION,
+        CONTACT_FRICTION,
+        SIMULATION_TIMESTEP,
+        addHeader,
+    )
 
     addHeader(rootNode)
-    add_floor(rootNode)
+    camera = add_scene_camera(rootNode)
+    floor = add_floor(rootNode)
     robot_node = Robot(rootNode).addRobot()
-    add_demo_object(rootNode)
+    object_selection = selected_object_name()
+    demo_object = add_demo_object(rootNode, object_selection)
+    contact_listeners = add_demo_contact_listeners(
+        rootNode, robot_node, floor, demo_object
+    )
     limits = joint_limits()
+
+    object_label = {
+        "cable": "flexible cable",
+        "ball": "deformable ball",
+        "none": "no deformable object",
+    }[object_selection]
+    representative_index = (
+        CABLE_GRASP_INDEX if object_selection == "cable" else None
+    )
+    recorder_configuration = {
+        "robot": "UR5 + OnRobot RG2",
+        "robot model source": "AndrejOrsula/ur5_rg2_ign",
+        "deformable object": object_label,
+        "SOFA version (configured)": CONFIGURED_SOFA_VERSION,
+        "timestep": {"value": SIMULATION_TIMESTEP, "unit": "s"},
+        "nominal control frequency": {
+            "value": 1.0 / SIMULATION_TIMESTEP,
+            "unit": "Hz",
+        },
+        "contact friction coefficient": CONTACT_FRICTION,
+        "controller": "Xbox controller or Tk sliders",
+    }
+    if object_selection == "cable":
+        recorder_configuration.update(
+            {
+                "cable length": {"value": CABLE_LENGTH, "unit": "m"},
+                "cable diameter": {
+                    "value": 2.0 * CABLE_RADIUS,
+                    "unit": "m",
+                },
+                "cable mass": {"value": CABLE_MASS, "unit": "kg"},
+                "cable mechanical nodes": CABLE_NODE_COUNT,
+            }
+        )
+
     robot_node.addObject(
         RobotGUI(
             name="sliderController",
             robot=robot_node,
             articulations_mo=robot_node.Articulations.getObject("dofs"),
+            rigid_mo=robot_node.Articulations.Rigid.getObject("dofs"),
+            object_mo=(
+                demo_object.getObject("dofs")
+                if demo_object is not None
+                else None
+            ),
+            root_node=rootNode,
+            camera=camera,
+            eeRigidIndices=(
+                RIGID_INDEX["rg2_leftfinger"],
+                RIGID_INDEX["rg2_rightfinger"],
+            ),
+            contactListeners=contact_listeners,
+            jointNames=ACTUATED_JOINT_NAMES,
+            objectLabel=object_label,
+            representativeObjectIndex=representative_index,
+            recorderConfiguration=recorder_configuration,
+            projectRoot=Path(__file__).resolve().parent,
             initAngles=robot_node.getData("angles").value,
             armLimits=limits[:6],
             gripperLimit=limits[6],
             controlDt=float(rootNode.findData("dt").value),
         )
+    )
+
+    print(
+        "[squashSim] Xbox: left stick selects; triggers move; bumpers set "
+        "speed; right stick orbits camera; A starts/stops recording"
     )
 
     Sim.initTextures(rootNode)

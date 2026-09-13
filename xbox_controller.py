@@ -36,10 +36,13 @@ class GamepadSample:
     name: str = ""
     status: str = "No Xbox-compatible controller detected"
     left_x: float = 0.0
+    right_x: float = 0.0
+    right_y: float = 0.0
     left_trigger: float = 0.0
     right_trigger: float = 0.0
     left_bumper: bool = False
     right_bumper: bool = False
+    a_button: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class ControlUpdate:
     speed_index: int
     command_delta: float
     state_changed: bool
+    recording_toggle: bool
 
 
 class XboxControlState:
@@ -65,6 +69,7 @@ class XboxControlState:
         self._selector_armed = True
         self._left_bumper_was_down = False
         self._right_bumper_was_down = False
+        self._a_button_was_down = False
 
     @property
     def speed_name(self):
@@ -78,6 +83,7 @@ class XboxControlState:
         self._selector_armed = True
         self._left_bumper_was_down = False
         self._right_bumper_was_down = False
+        self._a_button_was_down = False
 
     def step(self, sample, dt):
         """Advance by ``dt`` seconds and return a joint command increment."""
@@ -90,6 +96,7 @@ class XboxControlState:
                 self.speed_index,
                 0.0,
                 state_changed,
+                False,
             )
 
         left_x = max(-1.0, min(1.0, float(sample.left_x)))
@@ -124,6 +131,10 @@ class XboxControlState:
         self._left_bumper_was_down = left_bumper
         self._right_bumper_was_down = right_bumper
 
+        a_button = bool(sample.a_button)
+        recording_toggle = a_button and not self._a_button_was_down
+        self._a_button_was_down = a_button
+
         left_trigger = max(0.0, min(1.0, float(sample.left_trigger)))
         right_trigger = max(0.0, min(1.0, float(sample.right_trigger)))
         signed_trigger = right_trigger - left_trigger
@@ -147,6 +158,7 @@ class XboxControlState:
             self.speed_index,
             command_delta,
             state_changed,
+            recording_toggle,
         )
 
 
@@ -158,8 +170,11 @@ class PygameXboxBackend:
     # builds usable as well.
     _CONSTANT_DEFAULTS = {
         "CONTROLLER_AXIS_LEFTX": 0,
+        "CONTROLLER_AXIS_RIGHTX": 2,
+        "CONTROLLER_AXIS_RIGHTY": 3,
         "CONTROLLER_AXIS_TRIGGERLEFT": 4,
         "CONTROLLER_AXIS_TRIGGERRIGHT": 5,
+        "CONTROLLER_BUTTON_A": 0,
         "CONTROLLER_BUTTON_LEFTSHOULDER": 9,
         "CONTROLLER_BUTTON_RIGHTSHOULDER": 10,
     }
@@ -296,6 +311,16 @@ class PygameXboxBackend:
                         self._constants["CONTROLLER_AXIS_LEFTX"]
                     )
                 ),
+                right_x=self._normalise_stick(
+                    self._controller.get_axis(
+                        self._constants["CONTROLLER_AXIS_RIGHTX"]
+                    )
+                ),
+                right_y=self._normalise_stick(
+                    self._controller.get_axis(
+                        self._constants["CONTROLLER_AXIS_RIGHTY"]
+                    )
+                ),
                 left_trigger=self._normalise_trigger(
                     self._controller.get_axis(
                         self._constants["CONTROLLER_AXIS_TRIGGERLEFT"]
@@ -314,6 +339,11 @@ class PygameXboxBackend:
                 right_bumper=bool(
                     self._controller.get_button(
                         self._constants["CONTROLLER_BUTTON_RIGHTSHOULDER"]
+                    )
+                ),
+                a_button=bool(
+                    self._controller.get_button(
+                        self._constants["CONTROLLER_BUTTON_A"]
                     )
                 ),
             )

@@ -1,12 +1,18 @@
-"""Mouse-slider and optional Xbox control for the UR5 + mirrored RG2."""
+"""Mouse/Xbox control and synchronous recording for the UR5 + RG2."""
 
+from pathlib import Path
 import threading
+import time
 
+import numpy as np
 import Sofa.Core
 import tkinter as tkinter
 
+from camera_controller import orbit_camera
+from episode_recorder import EpisodeRecorder, FrameSample
 from xbox_controller import (
     CONTROL_LABELS,
+    GamepadSample,
     PygameXboxBackend,
     SPEED_PRESETS,
     XboxControlState,
@@ -15,6 +21,7 @@ from xbox_controller import (
 
 ARM_LABELS = CONTROL_LABELS[:6]
 SELECTED_LABEL_COLOR = "#9ecbff"
+MAX_WALL_CONTROL_DT = 0.05
 
 
 def expand_gui_commands(commands):
@@ -164,6 +171,14 @@ class RobotGUI(Sofa.Core.Controller):
         Sofa.Core.Controller.__init__(self, *args, **kwargs)
         self.robot = kwargs["robot"]
         self.articulations = kwargs["articulations_mo"]
+        self.rigid_dofs = kwargs.get("rigid_mo")
+        self.object_dofs = kwargs.get("object_mo")
+        self.root_node = kwargs.get("root_node")
+        self.camera = kwargs.get("camera")
+        self.ee_rigid_indices = tuple(kwargs.get("eeRigidIndices", (7, 8)))
+        self.contact_listeners = kwargs.get(
+            "contactListeners", {"gripper": (), "floor": ()}
+        )
         self.control_dt = float(kwargs.get("controlDt", 0.005))
         self.app = App(
             kwargs.get("initAngles", [0.0] * 6 + [1.18, 1.18]),
@@ -174,7 +189,155 @@ class RobotGUI(Sofa.Core.Controller):
         if self.gamepad is None:
             self.gamepad = PygameXboxBackend()
         self.gamepad_state = XboxControlState(len(CONTROL_LABELS))
+        self._clock = kwargs.get("clock") or time.monotonic
+        self._last_control_wall_time = None
         self._last_gamepad_status = None
+        self._last_sample = GamepadSample()
+        self._last_command_delta = 0.0
+        self._last_commands = expand_gui_commands(self.app.get_commands())
+        self._record_stop_requested = False
+        self._recording_error_reported = False
+        self._camera_error_reported = False
+
+        self.recorder = kwargs.get("episodeRecorder")
+        if self.recorder is None and self.root_node is not None:
+            self.recorder = EpisodeRecorder(
+                project_root=kwargs.get(
+                    "projectRoot", Path(__file__).resolve().parent
+                ),
+                joint_names=kwargs.get(
+                    "jointNames",
+                    (
+                        "J1",
+                        "J2",
+                        "J3",
+                        "J4",
+                        "J5",
+                        "J6",
+                        "RG2-left",
+                        "RG2-right",
+                    ),
+                ),
+                control_labels=CONTROL_LABELS,
+                object_label=kwargs.get("objectLabel", "deformable object"),
+                representative_object_index=kwargs.get(
+                    "representativeObjectIndex"
+                ),
+                configuration=kwargs.get("recorderConfiguration", {}),
+            )
+
+    def _wall_control_dt(self):
+        """Use elapsed real time so control speed is independent of frame rate."""
+        now = float(self._clock())
+        if self._last_control_wall_time is None:
+            elapsed = self.control_dt
+        else:
+            elapsed = now - self._last_control_wall_time
+        self._last_control_wall_time = now
+        if not np.isfinite(elapsed) or elapsed <= 0.0:
+            return self.control_dt
+        return min(elapsed, MAX_WALL_CONTROL_DT)
+
+    def _recording_status(self):
+        if self.recorder is None:
+            return "recording unavailable"
+        if self.recorder.is_recording:
+            if self._record_stop_requested:
+                return "REC saving..."
+            return f"REC {self.recorder.recorded_duration_s:.1f}s | A: stop"
+        if self.recorder.last_export_directory is not None:
+            return (
+                "A: record | saved "
+                f"{self.recorder.last_export_directory.name}"
+            )
+        return "A: record"
+
+    @staticmethod
+    def _mechanical_values(mechanical_object, data_name):
+        return np.asarray(
+            mechanical_object.getData(data_name).value, dtype=float
+        ).copy()
+
+    @staticmethod
+    def _contact_count(listeners):
+        return sum(int(listener.getNumberOfContacts()) for listener in listeners)
+
+    def _capture_frame(self):
+        joint_position = self._mechanical_values(
+            self.articulations, "position"
+        ).reshape(-1)
+        joint_velocity = self._mechanical_values(
+            self.articulations, "velocity"
+        ).reshape(-1)
+
+        rigid_positions = self._mechanical_values(
+            self.rigid_dofs, "position"
+        )
+        if rigid_positions.ndim == 1:
+            rigid_positions = rigid_positions.reshape(-1, 7)
+        ee_position = rigid_positions[
+            list(self.ee_rigid_indices), :3
+        ].mean(axis=0)
+
+        if self.object_dofs is None:
+            object_positions = np.empty((0, 3), dtype=float)
+        else:
+            object_state = self._mechanical_values(
+                self.object_dofs, "position"
+            )
+            if object_state.ndim == 1:
+                coordinate_count = 7 if object_state.size % 7 == 0 else 3
+                object_state = object_state.reshape(-1, coordinate_count)
+            object_positions = object_state[:, :3]
+
+        speed_index = self.gamepad_state.speed_index
+        speed = SPEED_PRESETS[speed_index][1]
+        sample = self._last_sample
+        return FrameSample(
+            sim_time_s=float(self.root_node.getTime()),
+            simulation_dt_s=float(self.root_node.getDt()),
+            joint_position_rad=joint_position,
+            joint_velocity_rad_s=joint_velocity,
+            commanded_joint_position_rad=np.asarray(
+                self._last_commands, dtype=float
+            ),
+            object_node_position_m=object_positions,
+            ee_position_m=ee_position,
+            selected_control_index=self.gamepad_state.selected_index,
+            speed_index=speed_index,
+            command_speed_rad_s=speed,
+            command_delta_rad=self._last_command_delta,
+            left_x=sample.left_x,
+            right_x=sample.right_x,
+            right_y=sample.right_y,
+            left_trigger=sample.left_trigger,
+            right_trigger=sample.right_trigger,
+            left_bumper=sample.left_bumper,
+            right_bumper=sample.right_bumper,
+            a_button=sample.a_button,
+            gripper_object_contact_count=self._contact_count(
+                self.contact_listeners.get("gripper", ())
+            ),
+            floor_object_contact_count=self._contact_count(
+                self.contact_listeners.get("floor", ())
+            ),
+        )
+
+    def _finish_recording(self):
+        if self.recorder is None or not self.recorder.is_recording:
+            self._record_stop_requested = False
+            return
+        try:
+            output_directory = self.recorder.stop_and_export()
+            print(f"[squashSim] recording SAVED: {output_directory}")
+            print(
+                "[squashSim] evidence: episode.npz, samples.csv, "
+                "metadata/tables and SVG plots"
+            )
+        except Exception as error:
+            print(f"[squashSim] recording export FAILED: {error}")
+        finally:
+            self._record_stop_requested = False
 
     def reset(self):
         if self.app.ready.is_set() and not self.app.closed.is_set():
@@ -185,20 +348,45 @@ class RobotGUI(Sofa.Core.Controller):
             return
 
         sample = self.gamepad.poll()
-        update = self.gamepad_state.step(sample, self.control_dt)
+        wall_dt = self._wall_control_dt()
+        update = self.gamepad_state.step(sample, wall_dt)
+        self._last_sample = sample
+        self._last_command_delta = update.command_delta
         if update.command_delta != 0.0:
             self.app.adjust_command(
                 update.selected_index, update.command_delta
             )
 
+        if self.camera is not None and sample.connected:
+            try:
+                orbit_camera(
+                    self.camera, sample.right_x, sample.right_y, wall_dt
+                )
+            except Exception as error:
+                if not self._camera_error_reported:
+                    print(f"[squashSim] right-stick camera disabled: {error}")
+                    self._camera_error_reported = True
+
+        if update.recording_toggle and self.recorder is not None:
+            if self.recorder.is_recording:
+                self._record_stop_requested = True
+            else:
+                output_directory = self.recorder.start(
+                    float(self.root_node.getTime())
+                )
+                self._record_stop_requested = False
+                self._recording_error_reported = False
+                print(f"[squashSim] recording START: {output_directory}")
+
         speed_name, speed = SPEED_PRESETS[update.speed_index]
         if sample.connected:
             status = (
                 f"Xbox: {CONTROL_LABELS[update.selected_index]} | "
-                f"speed: {speed_name} ({speed:.2f} rad/s)"
+                f"speed: {speed_name} ({speed:.2f} rad/s) | "
+                f"{self._recording_status()}"
             )
         else:
-            status = f"Xbox: {sample.status}"
+            status = f"Xbox: {sample.status} | {self._recording_status()}"
         self.app.set_controller_status(
             status, update.selected_index, sample.connected
         )
@@ -210,7 +398,24 @@ class RobotGUI(Sofa.Core.Controller):
         commands = self.app.get_commands()
         # The ArticulatedSystemPlugin requires one input DOF per finger centre.
         # Both receive the same GUI value, producing the RG2's mirrored motion.
-        self.robot.getData("angles").value = expand_gui_commands(commands)
+        self._last_commands = expand_gui_commands(commands)
+        self.robot.getData("angles").value = self._last_commands
+
+    def onAnimateEndEvent(self, _event):
+        if self.recorder is None or not self.recorder.is_recording:
+            return
+        try:
+            self.recorder.record(self._capture_frame())
+        except Exception as error:
+            if not self._recording_error_reported:
+                print(f"[squashSim] recording sample FAILED: {error}")
+                self._recording_error_reported = True
+        if self._record_stop_requested:
+            self._finish_recording()
+
+    def cleanup(self):
+        """Preserve an active recording if the SOFA scene is closed."""
+        self._finish_recording()
 
 
 def createScene(rootNode):
