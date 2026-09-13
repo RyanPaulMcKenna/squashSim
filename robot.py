@@ -537,6 +537,12 @@ def _part_transform(link_name, geometry_kind="collision"):
 def _add_part(parent, link_name, rigid_index):
     part = parent.addChild(link_name)
 
+    # Group 1 suppresses collision between the robot's own meshes. The base
+    # additionally belongs to group 2 so its permanent, bolted contact with the
+    # floor is ignored. Moving links share no group with the floor and therefore
+    # generate normal contact constraints against it.
+    collision_groups = [1, 2] if link_name == "base_link" else [1]
+
     collision = part.addChild("Collision")
     collision.addObject(
         "MeshSTLLoader",
@@ -567,7 +573,7 @@ def _add_part(parent, link_name, rigid_index):
         moving=True,
         simulated=True,
         selfCollision=False,
-        group=[1],
+        group=collision_groups,
     )
     collision.addObject(
         "RigidMapping",
@@ -639,9 +645,9 @@ def _add_articulation_center(
 def add_floor(root_node, name="Floor"):
     """Add a visible static slab whose top meets the UR5 base.
 
-    The collision surface shares group 1 with the robot. SOFA therefore skips
-    the permanent robot/floor contact at the bolted base, while a future object
-    placed in another group can collide with both surfaces.
+    The floor is group 2. Only the base also belongs to group 2, suppressing
+    that permanent contact pair; the moving robot links remain in group 1 and
+    collide with this surface.
     """
     half = FLOOR_HALF_EXTENT
     top = FLOOR_TOP_Y
@@ -675,7 +681,7 @@ def add_floor(root_node, name="Floor"):
         moving=False,
         simulated=False,
         selfCollision=False,
-        group=[1],
+        group=[2],
     )
 
     # Render a thin box rather than a zero-thickness quad so the floor remains
@@ -849,6 +855,7 @@ class Robot:
             f"{len(ACTUATED_JOINT_NAMES)} revolute DOFs"
         )
         print("[squashSim] geometry: DAE visuals + STL collisions")
+        print("[squashSim] contact: moving robot links collide with floor")
         return robot_node
 
 
