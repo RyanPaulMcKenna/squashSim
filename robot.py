@@ -876,6 +876,7 @@ def createScene(rootNode):
             initAngles=robot_node.getData("angles").value,
             armLimits=limits[:6],
             gripperLimit=limits[6],
+            controlDt=float(rootNode.findData("dt").value),
         )
     )
 
