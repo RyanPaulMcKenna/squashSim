@@ -196,6 +196,12 @@ class RobotModelTests(unittest.TestCase):
         self.assertEqual(
             len(articulations.Rigid.dofs.parameters["position"]), 9
         )
+        fixed_base = articulations.Rigid.fixedBase
+        self.assertEqual(
+            fixed_base.component_type, "FixedProjectiveConstraint"
+        )
+        self.assertEqual(fixed_base.parameters["template"], "Rigid3d")
+        self.assertEqual(fixed_base.parameters["indices"], [0])
 
         center_nodes = articulations.ArticulationCenters.children
         self.assertEqual(len(center_nodes), 8)
@@ -235,6 +241,38 @@ class RobotModelTests(unittest.TestCase):
                 len(part.Visual.model.parameters["triangles"]),
                 len(self.robot.VISUAL_MESHES[link_name].triangles),
             )
+
+        base_state_types = {"MechanicalObject", "OglModel"}
+        for node in root.walk():
+            states = [
+                obj.component_type
+                for obj in node.objects
+                if isinstance(obj, FakeObject)
+                and obj.component_type in base_state_types
+            ]
+            self.assertLessEqual(
+                len(states), 1, f"multiple BaseStates in {node.path}: {states}"
+            )
+
+    def test_floor_scene_graph(self):
+        root = FakeNode()
+        floor = self.robot.add_floor(root)
+
+        collision = floor.Collision
+        self.assertEqual(len(collision.vertices.parameters["position"]), 4)
+        self.assertEqual(
+            collision.vertices.parameters["position"][0][1],
+            self.robot.FLOOR_TOP_Y,
+        )
+        self.assertEqual(len(collision.topology.parameters["triangles"]), 2)
+        self.assertFalse(collision.model.parameters["moving"])
+        self.assertFalse(collision.model.parameters["simulated"])
+        self.assertEqual(collision.model.parameters["group"], [1])
+
+        visual = floor.Visual.model
+        self.assertEqual(len(visual.parameters["position"]), 8)
+        self.assertEqual(len(visual.parameters["triangles"]), 12)
+        self.assertEqual(visual.parameters["color"], self.robot.FLOOR_COLOR)
 
         base_state_types = {"MechanicalObject", "OglModel"}
         for node in root.walk():

@@ -73,6 +73,14 @@ PART_COLORS = {
     "rg2_rightfinger": [0.86, 0.38, 0.08, 1.0],
 }
 
+# The reference base collision mesh reaches 3 mm below the URDF base frame.
+# Placing the floor here makes the robot sit on it without changing any of the
+# already-working articulation transforms.
+FLOOR_TOP_Y = -0.003
+FLOOR_HALF_EXTENT = 1.2
+FLOOR_THICKNESS = 0.03
+FLOOR_COLOR = [0.34, 0.37, 0.41, 1.0]
+
 
 @dataclass(frozen=True)
 class Origin:
@@ -628,6 +636,82 @@ def _add_articulation_center(
     return center
 
 
+def add_floor(root_node, name="Floor"):
+    """Add a visible static slab whose top meets the UR5 base.
+
+    The collision surface shares group 1 with the robot. SOFA therefore skips
+    the permanent robot/floor contact at the bolted base, while a future object
+    placed in another group can collide with both surfaces.
+    """
+    half = FLOOR_HALF_EXTENT
+    top = FLOOR_TOP_Y
+    bottom = top - FLOOR_THICKNESS
+
+    top_vertices = [
+        [-half, top, -half],
+        [half, top, -half],
+        [half, top, half],
+        [-half, top, half],
+    ]
+    # Counter-clockwise when viewed from above, giving an upward-facing normal.
+    top_triangles = [[0, 2, 1], [0, 3, 2]]
+
+    floor = root_node.addChild(name)
+    collision = floor.addChild("Collision")
+    collision.addObject(
+        "MechanicalObject",
+        name="vertices",
+        template="Vec3d",
+        position=top_vertices,
+    )
+    collision.addObject(
+        "MeshTopology",
+        name="topology",
+        triangles=top_triangles,
+    )
+    collision.addObject(
+        "TriangleCollisionModel",
+        name="model",
+        moving=False,
+        simulated=False,
+        selfCollision=False,
+        group=[1],
+    )
+
+    # Render a thin box rather than a zero-thickness quad so the floor remains
+    # easy to see from the default oblique camera angle. Keeping OglModel in a
+    # child node also preserves SOFA's one-BaseState-per-node requirement.
+    slab_vertices = top_vertices + [
+        [-half, bottom, -half],
+        [half, bottom, -half],
+        [half, bottom, half],
+        [-half, bottom, half],
+    ]
+    slab_triangles = [
+        [0, 2, 1], [0, 3, 2],       # top
+        [4, 5, 6], [4, 6, 7],       # bottom
+        [0, 1, 5], [0, 5, 4],       # front
+        [1, 2, 6], [1, 6, 5],       # right
+        [2, 3, 7], [2, 7, 6],       # back
+        [3, 0, 4], [3, 4, 7],       # left
+    ]
+    visual = floor.addChild("Visual")
+    visual.addObject(
+        "OglModel",
+        name="model",
+        position=slab_vertices,
+        triangles=slab_triangles,
+        color=FLOOR_COLOR,
+        updateNormals=True,
+    )
+
+    print(
+        "[squashSim] floor: "
+        f"{2.0 * half:.2f} x {2.0 * half:.2f} m, top y={top:.3f} m"
+    )
+    return floor
+
+
 def articulation_definitions():
     """Return all eight centres derived from the reference URDF."""
     definitions = []
@@ -772,6 +856,7 @@ def createScene(rootNode):
     from header import addHeader
 
     addHeader(rootNode)
+    add_floor(rootNode)
     robot_node = Robot(rootNode).addRobot()
     limits = joint_limits()
     robot_node.addObject(
