@@ -141,14 +141,46 @@ class RobotModelTests(unittest.TestCase):
             commands[:6] + [0.75, 0.75],
         )
 
-    def test_part_rotations_round_trip_through_transform_engine_quaternions(self):
-        for link_name in (*self.robot.RIGID_LINK_NAMES, "rg2_hand"):
-            rotation, _translation = self.robot._part_transform(link_name)
-            quaternion = Rotation.from_matrix(rotation).as_quat()
-            reconstructed = Rotation.from_quat(quaternion).as_matrix()
-            np.testing.assert_allclose(
-                reconstructed, rotation, atol=2e-8, err_msg=link_name
-            )
+    def test_part_rotations_round_trip_through_quaternions(self):
+        for geometry_kind in ("visual", "collision"):
+            for link_name in self.robot.PART_NAMES:
+                rotation, _translation = self.robot._part_transform(
+                    link_name, geometry_kind
+                )
+                quaternion = Rotation.from_matrix(rotation).as_quat()
+                reconstructed = Rotation.from_quat(quaternion).as_matrix()
+                np.testing.assert_allclose(
+                    reconstructed,
+                    rotation,
+                    atol=2e-8,
+                    err_msg=f"{link_name} {geometry_kind}",
+                )
+
+    def test_reference_visual_and_collision_paths_are_separate(self):
+        for link_name in self.robot.PART_NAMES:
+            visual_path = self.robot.VISUAL_MESH_PATHS[link_name]
+            collision_path = self.robot.COLLISION_MESH_PATHS[link_name]
+            self.assertEqual(visual_path.suffix, ".dae")
+            self.assertEqual(collision_path.suffix, ".stl")
+            self.assertTrue(visual_path.is_relative_to(self.robot.MODEL_ROOT))
+            self.assertTrue(collision_path.is_relative_to(self.robot.MODEL_ROOT))
+            self.assertNotEqual(visual_path, collision_path)
+
+    def test_collada_visuals_are_baked_and_well_formed(self):
+        for link_name, mesh in self.robot.VISUAL_MESHES.items():
+            self.assertGreater(len(mesh.positions), 0, link_name)
+            self.assertGreater(len(mesh.triangles), 0, link_name)
+            self.assertTrue(np.isfinite(mesh.positions).all(), link_name)
+            self.assertGreaterEqual(mesh.triangles.min(), 0, link_name)
+            self.assertLess(mesh.triangles.max(), len(mesh.positions), link_name)
+            # The raw RG2 DAE vertices are in millimetre-like coordinates.
+            # Its scene-node matrices bake them into the metre-scale model.
+            self.assertLess(np.abs(mesh.positions).max(), 1.0, link_name)
+
+        self.assertIs(
+            self.robot.VISUAL_MESHES["rg2_leftfinger"],
+            self.robot.VISUAL_MESHES["rg2_rightfinger"],
+        )
 
     def test_complete_scene_graph(self):
         root = FakeNode()
@@ -180,8 +212,29 @@ class RobotModelTests(unittest.TestCase):
             if isinstance(obj, FakeObject)
         ]
         self.assertEqual(component_types.count("TriangleCollisionModel"), 10)
+        self.assertEqual(component_types.count("MeshSTLLoader"), 10)
+        self.assertEqual(component_types.count("OglModel"), 10)
+        self.assertEqual(component_types.count("RigidMapping"), 20)
+        self.assertNotIn("IdentityMapping", component_types)
         self.assertNotIn("LineCollisionModel", component_types)
         self.assertNotIn("PointCollisionModel", component_types)
+
+        parts = articulations.Rigid.Parts
+        for link_name in self.robot.PART_NAMES:
+            part = getattr(parts, link_name)
+            self.assertEqual(
+                part.Collision.loader.parameters["filename"],
+                str(self.robot.COLLISION_MESH_PATHS[link_name]),
+            )
+            self.assertNotIn("src", part.Visual.model.parameters)
+            self.assertEqual(
+                len(part.Visual.model.parameters["position"]),
+                len(self.robot.VISUAL_MESHES[link_name].positions),
+            )
+            self.assertEqual(
+                len(part.Visual.model.parameters["triangles"]),
+                len(self.robot.VISUAL_MESHES[link_name].triangles),
+            )
 
         base_state_types = {"MechanicalObject", "OglModel"}
         for node in root.walk():

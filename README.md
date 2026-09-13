@@ -35,6 +35,7 @@ The expected files are:
 
 ```text
 $SQUASHSIM_UR5_RG2_ROOT/urdf/ur5_rg2.urdf
+$SQUASHSIM_UR5_RG2_ROOT/ur5_rg2/meshes/visual/...
 $SQUASHSIM_UR5_RG2_ROOT/ur5_rg2/meshes/collision/...
 ```
 
@@ -64,10 +65,18 @@ The two final values are kept equal by the GUI.
 
 ## Geometry and collision
 
-The scene uses the reference repository's STL meshes for both rendering and
-triangle collision. The meshes are already in metres and link-local URDF
-coordinates. A single right-handed transform converts the complete model from
-URDF Z-up coordinates into SOFA Y-up coordinates.
+The scene keeps rendering and collision geometry separate:
+
+- the reference repository's higher-detail DAE meshes are used only by
+  `OglModel` for rendering;
+- the reference repository's smaller STL meshes are used only by
+  `TriangleCollisionModel` for collision detection.
+
+The RG2 DAE files contain important scene-node transforms and scaling. A small
+COLLADA reader in `robot.py` bakes those transforms before giving the vertices
+to SOFA. This avoids using the raw, incorrectly scaled RG2 vertices while
+requiring no extra Python package. A right-handed transform then converts the
+complete model from URDF Z-up coordinates into SOFA Y-up coordinates.
 
 All robot triangle models share collision group `1`, preventing unwanted robot
 self-collision while leaving them available to collide with a future floor or

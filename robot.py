@@ -50,6 +50,11 @@ RIGID_LINK_NAMES = (
     "rg2_rightfinger",
 )
 RIGID_INDEX = {name: index for index, name in enumerate(RIGID_LINK_NAMES)}
+PART_NAMES = RIGID_LINK_NAMES[:7] + (
+    "rg2_hand",
+    "rg2_leftfinger",
+    "rg2_rightfinger",
+)
 
 # Convert the reference model's Z-up coordinates into SOFA's Y-up world with
 # a proper right-handed -90 degree rotation around X.
@@ -84,6 +89,12 @@ class JointSpec:
     axis: np.ndarray
     lower: float
     upper: float
+
+
+@dataclass(frozen=True)
+class TriangleMesh:
+    positions: np.ndarray
+    triangles: np.ndarray
 
 
 def _numbers(text, default):
@@ -167,13 +178,18 @@ LINKS, JOINTS = _load_urdf()
 HAND_MOUNT = JOINTS["ur5_hand_joint"]
 
 
-def _mesh_path(link_name):
-    collision = LINKS[link_name].find("collision")
-    if collision is None:
-        raise ValueError(f"Link {link_name!r} has no collision mesh in {URDF_PATH}")
-    mesh = collision.find("./geometry/mesh")
+def _mesh_path(link_name, geometry_kind):
+    geometry = LINKS[link_name].find(geometry_kind)
+    if geometry is None:
+        raise ValueError(
+            f"Link {link_name!r} has no {geometry_kind} mesh in {URDF_PATH}"
+        )
+    mesh = geometry.find("./geometry/mesh")
     if mesh is None:
-        raise ValueError(f"Link {link_name!r} has no mesh geometry in {URDF_PATH}")
+        raise ValueError(
+            f"Link {link_name!r} has no {geometry_kind} mesh geometry in "
+            f"{URDF_PATH}"
+        )
 
     uri = mesh.get("filename")
     package_prefix = "package://ur5_rg2_ign/"
@@ -184,12 +200,249 @@ def _mesh_path(link_name):
         path = raw_path if raw_path.is_absolute() else URDF_PATH.parent / raw_path
     path = path.resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"Mesh for {link_name!r} not found: {path}")
+        raise FileNotFoundError(
+            f"{geometry_kind.title()} mesh for {link_name!r} not found: {path}"
+        )
     return path
 
 
-MESH_PATHS = {
-    name: _mesh_path(name) for name in set(RIGID_LINK_NAMES) | {"rg2_hand"}
+VISUAL_MESH_PATHS = {
+    name: _mesh_path(name, "visual") for name in PART_NAMES
+}
+COLLISION_MESH_PATHS = {
+    name: _mesh_path(name, "collision") for name in PART_NAMES
+}
+
+
+def _collada_ref(value):
+    if value is None or not value.startswith("#"):
+        raise ValueError(f"Unsupported COLLADA reference: {value!r}")
+    return value[1:]
+
+
+def _collada_source(source, namespace, path):
+    accessor = source.find("c:technique_common/c:accessor", namespace)
+    if accessor is None:
+        raise ValueError(f"Missing COLLADA accessor in {path}")
+
+    array_id = _collada_ref(accessor.get("source"))
+    array = next(
+        (child for child in source if child.get("id") == array_id), None
+    )
+    if array is None or array.text is None:
+        raise ValueError(f"Missing COLLADA array {array_id!r} in {path}")
+
+    values = np.fromstring(array.text, sep=" ", dtype=float)
+    count = int(accessor.get("count", "0"))
+    stride = int(accessor.get("stride", "1"))
+    offset = int(accessor.get("offset", "0"))
+    end = offset + count * stride
+    if count == 0 or stride < 3 or values.size < end:
+        raise ValueError(f"Invalid COLLADA accessor {array_id!r} in {path}")
+    return values[offset:end].reshape(count, stride)
+
+
+def _collada_geometry(geometry, namespace, path):
+    mesh = geometry.find("c:mesh", namespace)
+    if mesh is None:
+        raise ValueError(f"COLLADA geometry without a mesh in {path}")
+
+    unsupported = [
+        primitive.tag.rsplit("}", 1)[-1]
+        for primitive in mesh
+        if primitive.tag.rsplit("}", 1)[-1]
+        in {"lines", "linestrips", "polygons", "polylist", "trifans", "tristrips"}
+    ]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported COLLADA primitives {sorted(set(unsupported))} in {path}"
+        )
+
+    sources = {
+        source.get("id"): _collada_source(source, namespace, path)
+        for source in mesh.findall("c:source", namespace)
+    }
+    vertices = {}
+    for vertex_set in mesh.findall("c:vertices", namespace):
+        position_input = next(
+            (
+                item
+                for item in vertex_set.findall("c:input", namespace)
+                if item.get("semantic") == "POSITION"
+            ),
+            None,
+        )
+        if position_input is None:
+            raise ValueError(f"COLLADA vertices without positions in {path}")
+        source_id = _collada_ref(position_input.get("source"))
+        vertices[vertex_set.get("id")] = sources[source_id][:, :3]
+
+    position_tables = []
+    table_offsets = {}
+    triangle_tables = []
+    for triangle_set in mesh.findall("c:triangles", namespace):
+        inputs = triangle_set.findall("c:input", namespace)
+        vertex_input = next(
+            (
+                item
+                for item in inputs
+                if item.get("semantic") == "VERTEX"
+            ),
+            None,
+        )
+        if vertex_input is None:
+            raise ValueError(f"COLLADA triangles without vertices in {path}")
+
+        vertex_set_id = _collada_ref(vertex_input.get("source"))
+        if vertex_set_id not in table_offsets:
+            table_offsets[vertex_set_id] = sum(
+                len(table) for table in position_tables
+            )
+            position_tables.append(vertices[vertex_set_id])
+
+        index_stride = max(
+            int(item.get("offset", "0")) for item in inputs
+        ) + 1
+        index_element = triangle_set.find("c:p", namespace)
+        if index_element is None or index_element.text is None:
+            raise ValueError(f"COLLADA triangles without indices in {path}")
+        indices = np.fromstring(index_element.text, sep=" ", dtype=np.int64)
+        triangle_count = int(triangle_set.get("count", "0"))
+        expected_size = triangle_count * 3 * index_stride
+        if triangle_count == 0 or indices.size != expected_size:
+            raise ValueError(f"Invalid COLLADA triangle indices in {path}")
+
+        vertex_offset = int(vertex_input.get("offset", "0"))
+        triangles = indices.reshape(-1, index_stride)[:, vertex_offset]
+        triangles = triangles.reshape(-1, 3)
+        triangle_tables.append(triangles + table_offsets[vertex_set_id])
+
+    if not position_tables or not triangle_tables:
+        raise ValueError(f"No triangular geometry found in {path}")
+    return TriangleMesh(
+        positions=np.concatenate(position_tables),
+        triangles=np.concatenate(triangle_tables).astype(np.int32),
+    )
+
+
+def _collada_node_transform(node, path):
+    transform = np.eye(4)
+    for element in node:
+        tag = element.tag.rsplit("}", 1)[-1]
+        if tag == "matrix":
+            values = np.fromstring(element.text or "", sep=" ", dtype=float)
+            if values.size != 16:
+                raise ValueError(f"Invalid COLLADA matrix in {path}")
+            operation = values.reshape(4, 4)
+            if not np.allclose(operation[3], [0.0, 0.0, 0.0, 1.0]):
+                raise ValueError(f"Unsupported COLLADA matrix layout in {path}")
+        elif tag == "translate":
+            values = np.fromstring(element.text or "", sep=" ", dtype=float)
+            if values.size != 3:
+                raise ValueError(f"Invalid COLLADA translation in {path}")
+            operation = np.eye(4)
+            operation[:3, 3] = values
+        elif tag == "rotate":
+            values = np.fromstring(element.text or "", sep=" ", dtype=float)
+            if values.size != 4 or np.linalg.norm(values[:3]) == 0.0:
+                raise ValueError(f"Invalid COLLADA rotation in {path}")
+            axis = values[:3] / np.linalg.norm(values[:3])
+            operation = np.eye(4)
+            operation[:3, :3] = Rotation.from_rotvec(
+                axis * np.deg2rad(values[3])
+            ).as_matrix()
+        elif tag == "scale":
+            values = np.fromstring(element.text or "", sep=" ", dtype=float)
+            if values.size != 3:
+                raise ValueError(f"Invalid COLLADA scale in {path}")
+            operation = np.eye(4)
+            operation[np.arange(3), np.arange(3)] = values
+        elif tag in {"lookat", "skew"}:
+            raise ValueError(f"Unsupported COLLADA transform {tag!r} in {path}")
+        else:
+            continue
+        transform = transform @ operation
+    return transform
+
+
+def _load_collada_visual(path):
+    """Read and bake the reference DAE's scene-node transforms."""
+    document = ET.parse(path).getroot()
+    if "}" not in document.tag:
+        raise ValueError(f"COLLADA document has no XML namespace: {path}")
+    namespace = {"c": document.tag.split("}", 1)[0].lstrip("{")}
+
+    up_axis = document.find("c:asset/c:up_axis", namespace)
+    if up_axis is None or (up_axis.text or "").strip() != "Z_UP":
+        raise ValueError(f"Expected a Z_UP COLLADA visual mesh: {path}")
+    unit = document.find("c:asset/c:unit", namespace)
+    if unit is not None and not np.isclose(float(unit.get("meter", "1")), 1.0):
+        raise ValueError(f"Expected metre-based COLLADA coordinates: {path}")
+
+    geometries = {
+        geometry.get("id"): _collada_geometry(geometry, namespace, path)
+        for geometry in document.findall(
+            "c:library_geometries/c:geometry", namespace
+        )
+    }
+    scene_instance = document.find(
+        "c:scene/c:instance_visual_scene", namespace
+    )
+    if scene_instance is None:
+        raise ValueError(f"COLLADA document has no visual scene: {path}")
+    scene_id = _collada_ref(scene_instance.get("url"))
+    visual_scene = next(
+        (
+            scene
+            for scene in document.findall(
+                "c:library_visual_scenes/c:visual_scene", namespace
+            )
+            if scene.get("id") == scene_id
+        ),
+        None,
+    )
+    if visual_scene is None:
+        raise ValueError(f"COLLADA visual scene {scene_id!r} not found: {path}")
+
+    position_tables = []
+    triangle_tables = []
+
+    def visit(node, parent_transform):
+        node_transform = parent_transform @ _collada_node_transform(node, path)
+        for instance in node.findall("c:instance_geometry", namespace):
+            geometry_id = _collada_ref(instance.get("url"))
+            if geometry_id not in geometries:
+                raise ValueError(
+                    f"COLLADA geometry {geometry_id!r} not found: {path}"
+                )
+            mesh = geometries[geometry_id]
+            transformed = (
+                node_transform[:3, :3] @ mesh.positions.T
+            ).T + node_transform[:3, 3]
+            vertex_offset = sum(len(table) for table in position_tables)
+            position_tables.append(transformed)
+            triangle_tables.append(mesh.triangles + vertex_offset)
+        for child in node.findall("c:node", namespace):
+            visit(child, node_transform)
+
+    for node in visual_scene.findall("c:node", namespace):
+        visit(node, np.eye(4))
+
+    if not position_tables:
+        raise ValueError(f"COLLADA visual scene contains no geometry: {path}")
+    return TriangleMesh(
+        positions=np.concatenate(position_tables),
+        triangles=np.concatenate(triangle_tables).astype(np.int32),
+    )
+
+
+_VISUAL_MESHES_BY_PATH = {
+    path: _load_collada_visual(path)
+    for path in dict.fromkeys(VISUAL_MESH_PATHS.values())
+}
+VISUAL_MESHES = {
+    name: _VISUAL_MESHES_BY_PATH[path]
+    for name, path in VISUAL_MESH_PATHS.items()
 }
 
 
@@ -239,9 +492,14 @@ def initial_rigid_poses():
     return [poses_by_link[name] for name in RIGID_LINK_NAMES]
 
 
-def _part_transform(link_name):
-    """Transform raw STL vertices into their SOFA computational rigid frame."""
-    collision_origin = _origin(LINKS[link_name].find("collision"))
+def _part_transform(link_name, geometry_kind="collision"):
+    """Transform URDF geometry into its SOFA computational rigid frame."""
+    geometry = LINKS[link_name].find(geometry_kind)
+    if geometry is None:
+        raise ValueError(
+            f"Link {link_name!r} has no {geometry_kind} geometry in {URDF_PATH}"
+        )
+    geometry_origin = _origin(geometry)
 
     if link_name in RIGID_LINK_NAMES[:7]:
         prefix_rotation = np.eye(3)
@@ -261,48 +519,49 @@ def _part_transform(link_name):
         # The finger rigid centre already sits at its joint origin.
         prefix_translation = np.zeros(3)
 
-    rotation = URDF_TO_SOFA @ prefix_rotation @ collision_origin.rotation
+    rotation = URDF_TO_SOFA @ prefix_rotation @ geometry_origin.rotation
     translation = URDF_TO_SOFA @ (
-        prefix_translation + prefix_rotation @ collision_origin.translation
+        prefix_translation + prefix_rotation @ geometry_origin.translation
     )
     return rotation, translation
 
 
 def _add_part(parent, link_name, rigid_index):
     part = parent.addChild(link_name)
-    geometry = part.addChild("Geometry")
-    geometry.addObject(
+
+    collision = part.addChild("Collision")
+    collision.addObject(
         "MeshSTLLoader",
         name="loader",
-        filename=str(MESH_PATHS[link_name]),
+        filename=str(COLLISION_MESH_PATHS[link_name]),
     )
-    geometry.addObject("MeshTopology", name="topology", src="@loader")
+    collision.addObject("MeshTopology", name="topology", src="@loader")
 
-    rotation, translation = _part_transform(link_name)
+    rotation, translation = _part_transform(link_name, "collision")
     quaternion = Rotation.from_matrix(rotation).as_quat()
-    geometry.addObject(
+    collision.addObject(
         "TransformEngine",
         name="urdfTransform",
         input_position="@loader.position",
         quaternion=quaternion.tolist(),
         translation=translation.tolist(),
     )
-    geometry.addObject(
+    collision.addObject(
         "MechanicalObject",
         name="vertices",
         template="Vec3d",
         position="@urdfTransform.output_position",
         rest_position="@urdfTransform.output_position",
     )
-    geometry.addObject(
+    collision.addObject(
         "TriangleCollisionModel",
-        name="collision",
+        name="model",
         moving=True,
         simulated=True,
         selfCollision=False,
         group=[1],
     )
-    geometry.addObject(
+    collision.addObject(
         "RigidMapping",
         name="rigidMapping",
         input="@../../../dofs",
@@ -311,19 +570,29 @@ def _add_part(parent, link_name, rigid_index):
         globalToLocalCoords=False,
     )
 
-    visual = geometry.addChild("Visual")
+    visual_mesh = VISUAL_MESHES[link_name]
+    visual_rotation, visual_translation = _part_transform(
+        link_name, "visual"
+    )
+    visual_positions = (
+        visual_rotation @ visual_mesh.positions.T
+    ).T + visual_translation
+    visual = part.addChild("Visual")
     visual.addObject(
         "OglModel",
         name="model",
-        src="@../loader",
+        position=visual_positions.tolist(),
+        triangles=visual_mesh.triangles.tolist(),
         color=PART_COLORS[link_name],
         updateNormals=True,
     )
     visual.addObject(
-        "IdentityMapping",
-        name="visualMapping",
-        input="@../vertices",
+        "RigidMapping",
+        name="rigidMapping",
+        input="@../../../dofs",
         output="@model",
+        index=rigid_index,
+        globalToLocalCoords=False,
     )
     return part
 
@@ -495,6 +764,7 @@ class Robot:
             f"{len(RIGID_LINK_NAMES)} rigid bodies, "
             f"{len(ACTUATED_JOINT_NAMES)} revolute DOFs"
         )
+        print("[squashSim] geometry: DAE visuals + STL collisions")
         return robot_node
 
 
