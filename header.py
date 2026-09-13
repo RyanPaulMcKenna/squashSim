@@ -25,7 +25,9 @@ def addHeader(rootNode):
     rootNode.addObject('RequiredPlugin', name='Sofa.Component.LinearSolver.Direct') # Needed to use components [SparseLDLSolver]  
     rootNode.addObject('RequiredPlugin', name='Sofa.Component.ODESolver.Backward') # Needed to use components [EulerImplicitSolver]  
     rootNode.addObject('RequiredPlugin', name='Sofa.Component.Setting') # Needed to use components [BackgroundSetting]  
+    rootNode.addObject('RequiredPlugin', name='Sofa.Component.SolidMechanics.FEM.Elastic') # Needed to use components [TetrahedronFEMForceField]
     rootNode.addObject('RequiredPlugin', name='Sofa.Component.SolidMechanics.Spring') # Needed to use components [RestShapeSpringsForceField] 
+    rootNode.addObject('RequiredPlugin', name='Sofa.Component.Topology.Mapping') # Needed to use components [Tetra2TriangleTopologicalMapping]
     rootNode.addObject('RequiredPlugin', name='MultiThreading') # Needed to use components [ParallelBVHNarrowPhase,ParallelBruteForceBroadPhase]
 
     rootNode.addObject('DefaultVisualManagerLoop')
@@ -36,13 +38,13 @@ def addHeader(rootNode):
     rootNode.addObject('CollisionPipeline')
     rootNode.addObject('ParallelBruteForceBroadPhase')
     rootNode.addObject('ParallelBVHNarrowPhase')
-    rootNode.addObject('NewProximityIntersection', alarmDistance='0.0008', contactDistance='0.0003')
+    rootNode.addObject('NewProximityIntersection', alarmDistance='0.003', contactDistance='0.001')
     rootNode.addObject('CollisionResponse', name='ContactManager', response='FrictionContactConstraint', responseParams='mu=0.25')
 
 
     rootNode.addObject("VisualStyle", displayFlags="showVisualModels hideMappings")
     rootNode.addObject('BackgroundSetting', color=[1., 1., 1., 1.])
-    rootNode.findData('dt').value=0.01
+    rootNode.findData('dt').value=0.005
     rootNode.gravity = [0,-9.810,0]
 
     # rootNode.addObject('ContactListener', name='contacts', listening='1')  # logs contacts

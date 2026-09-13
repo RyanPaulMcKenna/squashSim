@@ -15,6 +15,7 @@ import numpy as np
 import Sofa.Simulation as Sim
 from scipy.spatial.transform import Rotation
 
+from deformable_ball import add_deformable_ball
 from robotGUI import RobotGUI
 
 
@@ -865,6 +866,7 @@ def createScene(rootNode):
     addHeader(rootNode)
     add_floor(rootNode)
     robot_node = Robot(rootNode).addRobot()
+    add_deformable_ball(rootNode)
     limits = joint_limits()
     robot_node.addObject(
         RobotGUI(
