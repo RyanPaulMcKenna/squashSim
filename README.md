@@ -1,17 +1,89 @@
 # squashSim
-Simulation, Training and data collection, Dataset generator for Deformable Object Manipulation
 
+SOFA articulated-system scene for a UR5 with an OnRobot RG2 gripper.
 
-# Based on 
-https://github.com/sofa-framework/sofa/blob/master/applications/plugins/ArticulatedSystemPlugin/examples/ArticulatedArm/robot.py
+The implementation keeps the original squashSim structure—`robot.py`, an
+`ArticulatedHierarchyContainer`, an `ArticulatedSystemMapping`, and Tk slider
+control—but now derives the complete robot from Andrej Orsula's standardized
+UR5+RG2 description:
 
+- six UR5 revolute joints;
+- the fixed wrist-to-RG2 mount;
+- two simplified RG2 finger joints;
+- UR5, hand, and finger meshes;
+- joint centres, axes, limits, and fixed transforms read from the URDF.
 
+The two finger joints remain separate internally because SOFA requires one
+input DOF per articulation centre. One `RG2` slider mirrors the commanded value
+to both joints.
 
-# Use this command to run robot.py
+## Setup
 
-$RUN_SOFA -l SofaPython3 -l SofaAssimp -l ArticulatedSystemPlugin robot.py
+Clone the reference model into the default location:
 
+```bash
+git clone https://github.com/AndrejOrsula/ur5_rg2_ign.git ~/ur5_rg2_ign
+```
 
-# working dir
+If it is elsewhere, set:
 
-/ssd/ryanm/sofa/sofa/src/examples/Demos/squashSim
+```bash
+export SQUASHSIM_UR5_RG2_ROOT=/absolute/path/to/ur5_rg2_ign
+```
+
+The expected files are:
+
+```text
+$SQUASHSIM_UR5_RG2_ROOT/urdf/ur5_rg2.urdf
+$SQUASHSIM_UR5_RG2_ROOT/ur5_rg2/meshes/collision/...
+```
+
+## Run
+
+From the squashSim repository:
+
+```bash
+$RUN_SOFA -l SofaPython3 -l SofaAssimp -l ArticulatedSystemPlugin robot.py \
+  2>&1 | tee ur5-rg2.log
+```
+
+Press **Animate**, then use the seven sliders:
+
+| Slider | Command |
+| --- | --- |
+| J1–J6 | UR5 revolute joints, using the URDF limits |
+| RG2 | Both simplified finger joints, `0` closed to `1.18` open |
+
+The robot's internal `angles` data has eight entries:
+
+```text
+[J1, J2, J3, J4, J5, J6, RG2-left, RG2-right]
+```
+
+The two final values are kept equal by the GUI.
+
+## Geometry and collision
+
+The scene uses the reference repository's STL meshes for both rendering and
+triangle collision. The meshes are already in metres and link-local URDF
+coordinates. A single right-handed transform converts the complete model from
+URDF Z-up coordinates into SOFA Y-up coordinates.
+
+All robot triangle models share collision group `1`, preventing unwanted robot
+self-collision while leaving them available to collide with a future floor or
+deformable object in another group.
+
+The RG2 hand is a fixed part of the wrist rigid body. Its fixed URDF transform
+is applied to the hand geometry. The finger centres and axes are transformed
+through that same mount, so no manually tuned UR5 dimensions are present.
+
+Reference model: [AndrejOrsula/ur5_rg2_ign](https://github.com/AndrejOrsula/ur5_rg2_ign)
+
+## Static validation
+
+The URDF-to-SOFA transform and scene-graph tests can run without SOFA itself:
+
+```bash
+SQUASHSIM_UR5_RG2_ROOT=~/ur5_rg2_ign \
+python -m unittest -v tests.test_robot_model
+```

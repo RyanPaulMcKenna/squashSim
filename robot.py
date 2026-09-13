@@ -1,317 +1,519 @@
+"""UR5 + OnRobot RG2 articulated model for SOFA.
 
+The scene follows the original squashSim ArticulatedSystemPlugin layout, but
+all link geometry, joint centres, axes and limits come from Andrej Orsula's
+``ur5_rg2.urdf``. The two simplified RG2 finger joints remain separate SOFA
+articulations and are driven as a mirrored pair by one GUI command.
+"""
+
+import os
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
 import Sofa.Simulation as Sim
-import os, math, numpy as np
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation
 
-
-# ---------- Py3.12 / NumPy 2.x shims ----------
-import collections as _collections, collections.abc as _abc
-for _n in ("Mapping","MutableMapping","Sequence","MutableSequence","Set","MutableSet","Iterable"):
-    if not hasattr(_collections, _n):
-        setattr(_collections, _n, getattr(_abc, _n))
-import fractions as _fractions
-if not hasattr(_fractions, "gcd"):
-    _fractions.gcd = math.gcd
-for old, new in {"float": float, "float_": np.float64, "int": int, "bool": bool, "complex": complex}.items():
-    if not hasattr(np, old):
-        setattr(np, old, new)
-# ----------------------------------------------
-
-from urdfpy import URDF
 from robotGUI import RobotGUI
 
 
-URDF_PATH = os.path.expanduser("~/ws_ur/assets/urdf/ur5e/UR5e_calibrated.urdf")
-MESH_ROOT = os.path.dirname(URDF_PATH)
+MODEL_ROOT = Path(
+    os.environ.get("SQUASHSIM_UR5_RG2_ROOT", "~/ur5_rg2_ign")
+).expanduser().resolve()
+URDF_PATH = MODEL_ROOT / "urdf" / "ur5_rg2.urdf"
+MESH_ROOT = MODEL_ROOT / "ur5_rg2"
 
+ARM_JOINT_NAMES = (
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+)
+FINGER_JOINT_NAMES = ("rg2_finger_joint1", "rg2_finger_joint2")
+ACTUATED_JOINT_NAMES = ARM_JOINT_NAMES + FINGER_JOINT_NAMES
 
-def _resolve(p):  # URDF uses relative mesh paths
-    return p if os.path.isabs(p) else os.path.normpath(os.path.join(MESH_ROOT, p))
-
-robot = URDF.load(URDF_PATH)
-J = robot.joint_map
-L = {l.name: l for l in robot.links}
-
-
-partNames = [
-    "base_link_inertia",
+# The hand is fixed to wrist_3_link, so it shares rigid body index 6. Each
+# finger needs its own rigid output and ArticulationCenter even though the GUI
+# mirrors their values.
+RIGID_LINK_NAMES = (
+    "base_link",
     "shoulder_link",
     "upper_arm_link",
     "forearm_link",
     "wrist_1_link",
     "wrist_2_link",
-    "wrist_3_link"
-]
+    "wrist_3_link",
+    "rg2_leftfinger",
+    "rg2_rightfinger",
+)
+RIGID_INDEX = {name: index for index, name in enumerate(RIGID_LINK_NAMES)}
 
-collisionRotations = {
-    "base_link_inertia": (0, 90, 90),
-    "shoulder_link":     (0, 180, 180),
-    "upper_arm_link":    (90, 0, 180),
-    "forearm_link":      (90, 0, 180),
-    "wrist_1_link":      (90, 0, 0),
-    "wrist_2_link":      (-90, 0, 0),
-    "wrist_3_link":      (90, 0, 180)
+# Convert the reference model's Z-up coordinates into SOFA's Y-up world with
+# a proper right-handed -90 degree rotation around X.
+URDF_TO_SOFA = Rotation.from_euler("x", -90.0, degrees=True).as_matrix()
+
+PART_COLORS = {
+    "base_link": [0.17, 0.20, 0.23, 1.0],
+    "shoulder_link": [0.27, 0.50, 0.70, 1.0],
+    "upper_arm_link": [0.72, 0.75, 0.78, 1.0],
+    "forearm_link": [0.72, 0.75, 0.78, 1.0],
+    "wrist_1_link": [0.27, 0.50, 0.70, 1.0],
+    "wrist_2_link": [0.27, 0.50, 0.70, 1.0],
+    "wrist_3_link": [0.17, 0.20, 0.23, 1.0],
+    "rg2_hand": [0.12, 0.13, 0.15, 1.0],
+    "rg2_leftfinger": [0.86, 0.38, 0.08, 1.0],
+    "rg2_rightfinger": [0.86, 0.38, 0.08, 1.0],
 }
 
-collisionTranslations = {
-    "base_link_inertia": (0, 0, 0),
-    "shoulder_link":     (0, 0.015, 0),
-    "upper_arm_link":    (0, 0, 0),
-    "forearm_link":      (0, 0, -0.01),
-    "wrist_1_link":      (0, 0, 0),
-    "wrist_2_link":      (0, 0.01, 0),
-    "wrist_3_link":      (0, 0, 0.01)
+
+@dataclass(frozen=True)
+class Origin:
+    translation: np.ndarray
+    rotation: np.ndarray
+
+
+@dataclass(frozen=True)
+class JointSpec:
+    name: str
+    parent: str
+    child: str
+    origin: Origin
+    axis: np.ndarray
+    lower: float
+    upper: float
+
+
+def _numbers(text, default):
+    if text is None:
+        return np.asarray(default, dtype=float)
+    return np.fromstring(text, sep=" ", dtype=float)
+
+
+def _origin(element):
+    origin_element = element.find("origin")
+    if origin_element is None:
+        return Origin(np.zeros(3), np.eye(3))
+    translation = _numbers(origin_element.get("xyz"), [0.0, 0.0, 0.0])
+    rpy = _numbers(origin_element.get("rpy"), [0.0, 0.0, 0.0])
+    return Origin(translation, Rotation.from_euler("xyz", rpy).as_matrix())
+
+
+def _load_urdf():
+    if not URDF_PATH.is_file():
+        raise FileNotFoundError(
+            f"UR5+RG2 URDF not found: {URDF_PATH}\n"
+            "Clone https://github.com/AndrejOrsula/ur5_rg2_ign.git to "
+            "~/ur5_rg2_ign or set SQUASHSIM_UR5_RG2_ROOT."
+        )
+
+    root = ET.parse(URDF_PATH).getroot()
+    links = {element.get("name"): element for element in root.findall("link")}
+    joint_elements = {
+        element.get("name"): element for element in root.findall("joint")
+    }
+
+    required_links = set(RIGID_LINK_NAMES) | {"rg2_hand"}
+    missing_links = sorted(required_links - set(links))
+    missing_joints = sorted(
+        (set(ACTUATED_JOINT_NAMES) | {"ur5_hand_joint"})
+        - set(joint_elements)
+    )
+    if missing_links or missing_joints:
+        raise ValueError(
+            "The reference URDF does not contain the expected UR5+RG2 chain. "
+            f"Missing links={missing_links}, joints={missing_joints}"
+        )
+
+    joints = {}
+    for name, element in joint_elements.items():
+        limit = element.find("limit")
+        joints[name] = JointSpec(
+            name=name,
+            parent=element.find("parent").get("link"),
+            child=element.find("child").get("link"),
+            origin=_origin(element),
+            axis=_numbers(
+                element.find("axis").get("xyz")
+                if element.find("axis") is not None
+                else None,
+                [0.0, 0.0, 0.0],
+            ),
+            lower=float(limit.get("lower", "0")) if limit is not None else 0.0,
+            upper=float(limit.get("upper", "0")) if limit is not None else 0.0,
+        )
+
+    # ArticulatedSystemMapping cannot encode a fixed orientation between two
+    # movable rigid frames. The reference arm joints all have zero origin
+    # rotation, so their URDF transforms map directly to SOFA centres. The
+    # rotated fixed hand mount is folded into the RG2 mesh frames below.
+    rotated_arm_origins = [
+        name
+        for name in ARM_JOINT_NAMES
+        if not np.allclose(joints[name].origin.rotation, np.eye(3), atol=1e-9)
+    ]
+    if rotated_arm_origins:
+        raise ValueError(
+            "Unexpected rotated arm-joint origins in ur5_rg2.urdf: "
+            + ", ".join(rotated_arm_origins)
+        )
+
+    return links, joints
+
+
+LINKS, JOINTS = _load_urdf()
+HAND_MOUNT = JOINTS["ur5_hand_joint"]
+
+
+def _mesh_path(link_name):
+    collision = LINKS[link_name].find("collision")
+    if collision is None:
+        raise ValueError(f"Link {link_name!r} has no collision mesh in {URDF_PATH}")
+    mesh = collision.find("./geometry/mesh")
+    if mesh is None:
+        raise ValueError(f"Link {link_name!r} has no mesh geometry in {URDF_PATH}")
+
+    uri = mesh.get("filename")
+    package_prefix = "package://ur5_rg2_ign/"
+    if uri.startswith(package_prefix):
+        path = MESH_ROOT / uri[len(package_prefix) :]
+    else:
+        raw_path = Path(uri).expanduser()
+        path = raw_path if raw_path.is_absolute() else URDF_PATH.parent / raw_path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Mesh for {link_name!r} not found: {path}")
+    return path
+
+
+MESH_PATHS = {
+    name: _mesh_path(name) for name in set(RIGID_LINK_NAMES) | {"rg2_hand"}
 }
 
-collisionTranslations_zero = {
-    "base_link_inertia": (0, 0, 0),
-    "shoulder_link":     (0, 0, 0),
-    "upper_arm_link":    (0, 0, 0),
-    "forearm_link":      (0, 0, 0),
-    "wrist_1_link":      (0, 0, 0),
-    "wrist_2_link":      (0, 0, 0),
-    "wrist_3_link":      (0, 0, 0)
-}
 
-GRIPPER_MESH_ROOT = '/home/ryanm/ur5_rg2_ign/ur5_rg2/meshes/' # dae /visual/rg2, stl /collision/rg2
-# ----------------------------------------------
-
-# Visual Meshes
-visual_basePath = _resolve(L[partNames[0]].visuals[0].geometry.mesh.filename)
-visual_shoulderPath = _resolve(L[partNames[1]].visuals[0].geometry.mesh.filename)
-visual_upperarmPath = _resolve(L[partNames[2]].visuals[0].geometry.mesh.filename)
-visual_forearmPath = _resolve(L[partNames[3]].visuals[0].geometry.mesh.filename)
-visual_wrist1Path = _resolve(L[partNames[4]].visuals[0].geometry.mesh.filename)
-visual_wrist2Path = _resolve(L[partNames[5]].visuals[0].geometry.mesh.filename)
-visual_wrist3Path = _resolve(L[partNames[6]].visuals[0].geometry.mesh.filename)
-rg2HandVisualPath = GRIPPER_MESH_ROOT + 'visual/rg2/hand.dae'
-# rg2FingerVisual = GRIPPER_MESH_ROOT.join('/meshes/visual/finger.dae')
+def _as_pose(transform):
+    quaternion = Rotation.from_matrix(transform[:3, :3]).as_quat()
+    return [*transform[:3, 3].tolist(), *quaternion.tolist()]
 
 
-# Collision Meshes
-collision_basePath = _resolve(L[partNames[0]].collisions[0].geometry.mesh.filename)
-collision_shoulderPath = _resolve(L[partNames[1]].collisions[0].geometry.mesh.filename)
-collision_upperarmPath = _resolve(L[partNames[2]].collisions[0].geometry.mesh.filename)
-collision_forearmPath = _resolve(L[partNames[3]].collisions[0].geometry.mesh.filename)
-collision_wrist1Path = _resolve(L[partNames[4]].collisions[0].geometry.mesh.filename)
-collision_wrist2Path = _resolve(L[partNames[5]].collisions[0].geometry.mesh.filename)
-collision_wrist3Path = _resolve(L[partNames[6]].collisions[0].geometry.mesh.filename)
-rg2HandCollisPath = GRIPPER_MESH_ROOT + 'collision/rg2/hand.stl'
+def _basis_transform(transform):
+    converted = np.eye(4)
+    converted[:3, :3] = URDF_TO_SOFA @ transform[:3, :3] @ URDF_TO_SOFA.T
+    converted[:3, 3] = URDF_TO_SOFA @ transform[:3, 3]
+    return converted
 
 
-def addVisu(node, index, filename, texfilename=None):
-    # Make a container node for this part's visuals
-    visu = node.addChild(f'Visu{index}')
-
-    # --- geometry branch (holds the state for vertices) ---
-    geom = visu.addChild('geom')
-    geom.addObject("AssimpLoader", name="loader", filename=filename, scale="0.001")
-    geom.addObject("MeshTopology", src="@loader")  
-
-    # Vertices must be a MechanicalObject and must be float (Vec3d) to match OglModel
-    geom.addObject("MechanicalObject", name="vertices", template="Vec3d",
-                   position="@loader.position", rest_position="@loader.position")
-
-    # Drive these vertices with the k-th rigid pose from /rigid/dofs
-    geom.addObject("RigidMapping", input="@../../../../../dofs", output="@vertices",
-                   index=str(index), globalToLocalCoords="false")
-
-    # --- rendering branch (no MechanicalObject here) ---
-    visual = visu.addChild('visual')
-    # if texfilename is None:
-    visual.addObject("OglModel", 
-                    name="model", 
-                    src="@../geom/loader",
-                    useNormals="1",
-                    srgbTexturing="1"
-                    )
-    # else:
-    #     visual.addObject("OglModel", 
-    #                       name="model", 
-    #                       src="@../geom/loader", 
-    #                       useNormals="1", 
-    #                       alphaBlend="1",
-    #                       texturename="/home/ryanm/Shoulder_texture.png")
-        # Applies the texture to all sub-meshes, so the texture is being applied multiple times in different transformation, making it look like a big mess.
-    # Map the (already-driven) vertex positions into the OglModel
-    visual.addObject("IdentityMapping", input="@../geom/vertices", output="@.")
-
-    return
+def _origin_matrix(origin):
+    transform = np.eye(4)
+    transform[:3, :3] = origin.rotation
+    transform[:3, 3] = origin.translation
+    return transform
 
 
+def initial_rigid_poses():
+    """Return zero-angle poses for the nine SOFA rigid output frames."""
+    urdf_world = {"base_link": np.eye(4)}
+    for name in ARM_JOINT_NAMES:
+        joint = JOINTS[name]
+        urdf_world[joint.child] = urdf_world[joint.parent] @ _origin_matrix(
+            joint.origin
+        )
+
+    poses_by_link = {
+        name: _as_pose(_basis_transform(urdf_world[name]))
+        for name in RIGID_LINK_NAMES[:7]
+    }
+
+    wrist_world = urdf_world["wrist_3_link"]
+    mount = _origin_matrix(HAND_MOUNT.origin)
+    for name in FINGER_JOINT_NAMES:
+        joint = JOINTS[name]
+        centre = wrist_world @ mount @ _origin_matrix(joint.origin)
+        # The computational finger frame is aligned with the wrist at q=0.
+        # Its fixed hand rotation is applied to mesh vertices and axis instead.
+        centre[:3, :3] = wrist_world[:3, :3]
+        poses_by_link[joint.child] = _as_pose(_basis_transform(centre))
+
+    return [poses_by_link[name] for name in RIGID_LINK_NAMES]
 
 
+def _part_transform(link_name):
+    """Transform raw STL vertices into their SOFA computational rigid frame."""
+    collision_origin = _origin(LINKS[link_name].find("collision"))
 
-def addCollision(node, index, filename):
-    # Make a container node for this part's visuals
-    collis = node.addChild(f'Collis{index}')
+    if link_name in RIGID_LINK_NAMES[:7]:
+        prefix_rotation = np.eye(3)
+        prefix_translation = np.zeros(3)
+    elif link_name == "rg2_hand":
+        prefix_rotation = HAND_MOUNT.origin.rotation
+        prefix_translation = HAND_MOUNT.origin.translation
+    else:
+        finger_joint = next(
+            JOINTS[name]
+            for name in FINGER_JOINT_NAMES
+            if JOINTS[name].child == link_name
+        )
+        prefix_rotation = (
+            HAND_MOUNT.origin.rotation @ finger_joint.origin.rotation
+        )
+        # The finger rigid centre already sits at its joint origin.
+        prefix_translation = np.zeros(3)
 
-    # --- geometry branch (holds the state for vertices) ---
-    geom = collis.addChild('geom')
-    geom.addObject("AssimpLoader", name="loader", filename=filename, scale="1")
-    geom.addObject("MeshTopology", src="@loader")  
-
-    rx, ry, rz = collisionRotations[partNames[index]]
-    tx, ty, tz = collisionTranslations[partNames[index]]
-
-    geom.addObject("TransformEngine", name="tf",
-                input_position="@loader.position",
-                rotation=f"{rx} {ry} {rz}",
-                translation=f"{tx} {ty} {tz}")
-
-    geom.addObject("MechanicalObject", name="vertices", template="Vec3d",
-                position="@tf.output_position",      # <- not @tf.position
-                rest_position="@tf.output_position")  # <- same here
-
-    # Drive these vertices with the k-th rigid pose from /rigid/dofs
-    geom.addObject("RigidMapping", input="@../../../../../dofs", output="@vertices",
-                   index=str(index), globalToLocalCoords="false")
-
-    # actual collision models
-    geom.addObject("TriangleCollisionModel", moving="1", simulated="1")
-    geom.addObject("LineCollisionModel",     moving="1", simulated="1")
-    geom.addObject("PointCollisionModel",    moving="1", simulated="1")
-
-    return
+    rotation = URDF_TO_SOFA @ prefix_rotation @ collision_origin.rotation
+    translation = URDF_TO_SOFA @ (
+        prefix_translation + prefix_rotation @ collision_origin.translation
+    )
+    return rotation, translation
 
 
-def addCenter(node, name,
-              parentIndex, childIndex,
-              posOnParent, posOnChild,
-              articulationProcess,
-              isTranslation, isRotation, axis,
-              articulationIndex):
+def _add_part(parent, link_name, rigid_index):
+    part = parent.addChild(link_name)
+    geometry = part.addChild("Geometry")
+    geometry.addObject(
+        "MeshSTLLoader",
+        name="loader",
+        filename=str(MESH_PATHS[link_name]),
+    )
+    geometry.addObject("MeshTopology", name="topology", src="@loader")
 
-    center = node.addChild(name)
-    center.addObject('ArticulationCenter', parentIndex=parentIndex, childIndex=childIndex, posOnParent=posOnParent, posOnChild=posOnChild, articulationProcess=articulationProcess)
+    rotation, translation = _part_transform(link_name)
+    quaternion = Rotation.from_matrix(rotation).as_quat()
+    geometry.addObject(
+        "TransformEngine",
+        name="urdfTransform",
+        input_position="@loader.position",
+        quaternion=quaternion.tolist(),
+        translation=translation.tolist(),
+    )
+    geometry.addObject(
+        "MechanicalObject",
+        name="vertices",
+        template="Vec3d",
+        position="@urdfTransform.output_position",
+        rest_position="@urdfTransform.output_position",
+    )
+    geometry.addObject(
+        "TriangleCollisionModel",
+        name="collision",
+        moving=True,
+        simulated=True,
+        selfCollision=False,
+        group=[1],
+    )
+    geometry.addObject(
+        "RigidMapping",
+        name="rigidMapping",
+        input="@../../../dofs",
+        output="@vertices",
+        index=rigid_index,
+        globalToLocalCoords=False,
+    )
 
-    articulation = center.addChild('Articulation')
-    articulation.addObject('Articulation', translation=isTranslation, rotation=isRotation, rotationAxis=axis, articulationIndex=articulationIndex)
+    visual = geometry.addChild("Visual")
+    visual.addObject(
+        "OglModel",
+        name="model",
+        src="@../loader",
+        color=PART_COLORS[link_name],
+        updateNormals=True,
+    )
+    visual.addObject(
+        "IdentityMapping",
+        name="visualMapping",
+        input="@../vertices",
+        output="@model",
+    )
+    return part
 
+
+def _add_articulation_center(
+    parent,
+    name,
+    parent_index,
+    child_index,
+    position_on_parent,
+    axis,
+    articulation_index,
+):
+    center = parent.addChild(name)
+    center.addObject(
+        "ArticulationCenter",
+        name="center",
+        parentIndex=parent_index,
+        childIndex=child_index,
+        posOnParent=np.asarray(position_on_parent, dtype=float).tolist(),
+        posOnChild=[0.0, 0.0, 0.0],
+        articulationProcess=0,
+    )
+    articulation = center.addChild("Articulation")
+    articulation.addObject(
+        "Articulation",
+        name="joint",
+        translation=False,
+        rotation=True,
+        rotationAxis=np.asarray(axis, dtype=float).tolist(),
+        articulationIndex=articulation_index,
+    )
     return center
 
 
-def addPart(node, name, index, visuFilename, collisFilename, texfilename=None):
+def articulation_definitions():
+    """Return all eight centres derived from the reference URDF."""
+    definitions = []
+    for articulation_index, name in enumerate(ARM_JOINT_NAMES):
+        joint = JOINTS[name]
+        definitions.append(
+            {
+                "name": name,
+                "parent_index": RIGID_INDEX[joint.parent],
+                "child_index": RIGID_INDEX[joint.child],
+                "position_on_parent": URDF_TO_SOFA @ joint.origin.translation,
+                "axis": URDF_TO_SOFA @ joint.axis,
+                "articulation_index": articulation_index,
+            }
+        )
 
-    part = node.addChild(name)
-    visu = part.addChild('visual')
-    collis = part.addChild('collision')
-    addVisu(visu, index, visuFilename, texfilename)
-    if collisFilename is not None:
-        addCollision(collis, index, collisFilename)
+    mount_rotation = HAND_MOUNT.origin.rotation
+    mount_translation = HAND_MOUNT.origin.translation
+    for finger_offset, name in enumerate(FINGER_JOINT_NAMES):
+        joint = JOINTS[name]
+        definitions.append(
+            {
+                "name": name,
+                "parent_index": RIGID_INDEX["wrist_3_link"],
+                "child_index": RIGID_INDEX[joint.child],
+                "position_on_parent": URDF_TO_SOFA
+                @ (mount_translation + mount_rotation @ joint.origin.translation),
+                "axis": URDF_TO_SOFA
+                @ (mount_rotation @ joint.origin.rotation @ joint.axis),
+                "articulation_index": len(ARM_JOINT_NAMES) + finger_offset,
+            }
+        )
+    return definitions
 
-    return part
+
+def joint_limits():
+    return [
+        (JOINTS[name].lower, JOINTS[name].upper)
+        for name in ACTUATED_JOINT_NAMES
+    ]
+
+
+def _normalise_initial_angles(initial_angles):
+    if initial_angles is None:
+        open_angle = JOINTS[FINGER_JOINT_NAMES[0]].upper
+        return [0.0] * 6 + [open_angle, open_angle]
+    values = [float(value) for value in initial_angles]
+    if len(values) == 7:
+        values.append(values[-1])
+    if len(values) != 8:
+        raise ValueError("initAngles must contain 7 GUI values or 8 SOFA DOFs")
+    mirrored = 0.5 * (values[6] + values[7])
+    values[6] = mirrored
+    values[7] = mirrored
+    return values
+
 
 class Robot:
-
     def __init__(self, node):
-        self.node=node
+        self.node = node
+
+    def addRobot(self, name="Robot", initAngles=None):
+        initial_angles = _normalise_initial_angles(initAngles)
+        robot_node = self.node.addChild(name)
+        robot_node.addData(
+            "angles",
+            initial_angles,
+            None,
+            "UR5 joints followed by two mirrored RG2 finger joints, in radians",
+            "",
+            "vector<float>",
+        )
+        robot_node.addObject("EulerImplicitSolver")
+
+        articulations = robot_node.addChild("Articulations")
+        articulation_dofs = articulations.addObject(
+            "MechanicalObject",
+            name="dofs",
+            template="Vec1",
+            position=initial_angles,
+            rest_position=robot_node.getData("angles").getLinkPath(),
+        )
+        articulations.addObject("ArticulatedHierarchyContainer", name="hierarchy")
+        articulations.addObject("SparseLDLSolver", name="linearSolver")
+        articulations.addObject(
+            "UniformMass",
+            name="jointMass",
+            template="Vec1d",
+            # Keep the exact input form already known to work in squashSim.
+            vertexMass=" ".join(["1"] * len(ACTUATED_JOINT_NAMES)),
+        )
+        articulations.addObject(
+            "RestShapeSpringsForceField",
+            name="jointTargets",
+            stiffness=2000.0,
+            points=list(range(len(ACTUATED_JOINT_NAMES))),
+        )
+        articulations.addObject(
+            "LinearSolverConstraintCorrection",
+            name="constraintCorrection",
+            linearSolver="@linearSolver",
+        )
+
+        rigid = articulations.addChild("Rigid")
+        rigid_dofs = rigid.addObject(
+            "MechanicalObject",
+            name="dofs",
+            template="Rigid3d",
+            position=initial_rigid_poses(),
+            showObject=False,
+            showObjectScale=0.03,
+        )
+        rigid.addObject(
+            "ArticulatedSystemMapping",
+            name="articulatedMapping",
+            input1=articulation_dofs.getLinkPath(),
+            output=rigid_dofs.getLinkPath(),
+        )
+
+        parts = rigid.addChild("Parts")
+        for link_name in RIGID_LINK_NAMES[:7]:
+            _add_part(parts, link_name, RIGID_INDEX[link_name])
+        _add_part(parts, "rg2_hand", RIGID_INDEX["wrist_3_link"])
+        _add_part(parts, "rg2_leftfinger", RIGID_INDEX["rg2_leftfinger"])
+        _add_part(parts, "rg2_rightfinger", RIGID_INDEX["rg2_rightfinger"])
+
+        centers = articulations.addChild("ArticulationCenters")
+        for definition in articulation_definitions():
+            _add_articulation_center(centers, **definition)
+
+        print(f"[squashSim] URDF: {URDF_PATH}")
+        print(
+            "[squashSim] articulated UR5+RG2: "
+            f"{len(RIGID_LINK_NAMES)} rigid bodies, "
+            f"{len(ACTUATED_JOINT_NAMES)} revolute DOFs"
+        )
+        return robot_node
 
 
-    def addRobot(self, name='Robot'):
-
-        # Robot node
-        robotNode = self.node.addChild(name)
-
-        # Then in your Robot.addRobot():
-
-        # Positions of parts
-
-        cfg = {
-            "base_link-base_link_inertia":  0.0,
-            "shoulder_pan_joint":           0.0,
-            "shoulder_lift_joint":          0.0,
-            "elbow_joint":                  0.0,
-            "wrist_1_joint":                0.0,
-            "wrist_2_joint":                0.0,
-            "wrist_3_joint":                0.0,
-        }
-
-        A = np.array([  [1,0,0],
-                        [0,0,1],
-                        [0,1,0]], dtype=float)   # rotate -90° about X
-        ALIGN4 = np.eye(4); ALIGN4[:3,:3] = A
-        fk = robot.link_fk(cfg=cfg)   # dict for ALL links
-
-        positions = []
-        for name in partNames:
-            link = L[name]
-            # Compose link FK with visual origin in URDF frame:
-            T_wv_u = fk[link] @ link.visuals[0].origin
-            T_wv_s = ALIGN4 @ T_wv_u @ALIGN4.T
-            R_s = T_wv_s[:3,:3]; t_s = T_wv_s[:3,3]
-            qx, qy, qz, qw = R.from_matrix(R_s).as_quat()
-            positions.append([t_s[0], t_s[1], t_s[2], qx, qy, qz, qw])
-
-
-        # You can change the joint angles here
-        initAngles = [0, 0, 0, 0, 0, 0] # add for more dofs to control.
-
-        robotNode.addData('angles', initAngles, None, 'angle of articulations in radian', '', 'vector<float>')
-        robotNode.addObject('EulerImplicitSolver')
-        #robotNode.addObject('SparseLDLSolver')
-        #robotNode.addObject('GenericConstraintCorrection')
-
-        # Articulations node
-        articulations = robotNode.addChild('Articulations')
-        articulations.addObject('MechanicalObject', name='dofs', rest_position=robotNode.getData('angles').getLinkPath(), template='Vec1', position=initAngles)
-        articulations.addObject('ArticulatedHierarchyContainer')
-        articulations.addObject('SparseLDLSolver', name='als')                       # local linear solver for joints
-        articulations.addObject('UniformMass', template='Vec1d', vertexMass='1 1 1 1 1 1')  # 6 joints
-        articulations.addObject('RestShapeSpringsForceField', stiffness=2000, points=list(range(len(initAngles))))
-        articulations.addObject('LinearSolverConstraintCorrection', linearSolver='@als')
-
-
-        # Rigid
-        rigid = articulations.addChild('Rigid')
-        rigid.addObject('MechanicalObject', name='dofs', template='Rigid3d', showObject=False, showObjectScale=1, position=positions[:])
-        rigid.addObject('ArticulatedSystemMapping', input1=articulations.dofs.getLinkPath(), output=rigid.dofs.getLinkPath())
-        #masses = [float(L[name].inertial.mass) for name in partNames]
-        #rigid.addObject('UniformMass', template='Rigid3d', totalMass=sum(masses))
-        #rigid.addObject('UncoupledConstraintCorrection')
-
-
-        # Visu
-        parts = rigid.addChild('Parts')
-        addPart(parts, 'Base' , 0, visual_basePath, collision_basePath)
-        addPart(parts, 'Part1', 1, visual_shoulderPath, collision_shoulderPath, "/home/ryanm/Shoulder_texture.png")
-        addPart(parts, 'Part2', 2, visual_upperarmPath, collision_upperarmPath)
-        addPart(parts, 'Part3', 3, visual_forearmPath, collision_forearmPath)
-        addPart(parts, 'Part4', 4, visual_wrist1Path, collision_wrist1Path)
-        addPart(parts, 'Part5', 5, visual_wrist2Path, collision_wrist2Path)
-        addPart(parts, 'Part6', 6, visual_wrist3Path, collision_wrist3Path)
-        # addPart(parts, 'Part7', 7, rg2HandVisualPath, rg2HandCollisPath)
-
-
-
-        # Center of articulations
-        centers = articulations.addChild('ArticulationsCenters')
-        addCenter(centers, 'CenterBase' , 0, 1, [0, 0.1625, 0], [0, 0, 0], 0, 0, 1, [0, 1, 0], 0)
-        addCenter(centers, 'CenterPart1', 1, 2, [0, 0, 0.138], [0, 0, 0], 0, 0, 1, [0, 0, 1], 1)
-        addCenter(centers, 'CenterPart2', 2, 3, [0, 0.425, -0.131], [0, 0, 0], 0, 0, 1, [0, 0, 1], 2)
-        addCenter(centers, 'CenterPart3', 3, 4, [0, 0.3922, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 3)
-        addCenter(centers, 'CenterPart4', 4, 5, [0, 0, 0.1333-0.007], [0, 0, 0], 0, 0, 1, [0, 1, 0], 4)
-        addCenter(centers, 'CenterPart5', 5, 6, [0, 0.0997, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 5)
-        # addCenter(centers, 'CenterPart5', 6, 7, [0, 0.425, 0], [0, 0, 0], 0, 0, 1, [0, 0, 1], 6) # hand to wist3
-
-        #0 0 -0.0989
-        return robotNode
-
-
-# Test/example scene
 def createScene(rootNode):
-
     from header import addHeader
-    # from robotGUI import RobotGUI  # Uncomment this if you want to use the GUI
 
     addHeader(rootNode)
-
-
-    # Robot
-    robot = Robot(rootNode).addRobot()
-    robot.addObject(RobotGUI(robot=robot, articulations_mo=robot.Articulations.getObject('dofs')))  # Uncomment this if you want to use the GUI
-
+    robot_node = Robot(rootNode).addRobot()
+    limits = joint_limits()
+    robot_node.addObject(
+        RobotGUI(
+            name="sliderController",
+            robot=robot_node,
+            articulations_mo=robot_node.Articulations.getObject("dofs"),
+            initAngles=robot_node.getData("angles").value,
+            armLimits=limits[:6],
+            gripperLimit=limits[6],
+        )
+    )
 
     Sim.initTextures(rootNode)
-
-    return
+    return rootNode
