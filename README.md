@@ -63,11 +63,6 @@ The robot's internal `angles` data has eight entries:
 
 The two final values are kept equal by the GUI.
 
-The scene also creates a 2.4 m square visible floor. Its top is aligned with
-the underside of the reference UR5 base at `y = -0.003 m`, and rigid-body index
-zero is held by a `FixedProjectiveConstraint`, representing the base being
-bolted to the floor.
-
 ## Geometry and collision
 
 The scene keeps rendering and collision geometry separate:
@@ -83,10 +78,9 @@ to SOFA. This avoids using the raw, incorrectly scaled RG2 vertices while
 requiring no extra Python package. A right-handed transform then converts the
 complete model from URDF Z-up coordinates into SOFA Y-up coordinates.
 
-All robot triangle models and the floor share collision group `1`. This
-prevents robot self-collision and suppresses the permanent contact pair where
-the bolted base touches the floor. A future object assigned to another group
-will still be able to collide with both the floor and robot.
+All robot triangle models share collision group `1`, preventing unwanted robot
+self-collision while leaving them available to collide with a future floor or
+deformable object in another group.
 
 The RG2 hand is a fixed part of the wrist rigid body. Its fixed URDF transform
 is applied to the hand geometry. The finger centres and axes are transformed
