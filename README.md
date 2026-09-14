@@ -99,10 +99,14 @@ friction. That is intentional for this narrow demonstrator.
 
 Press **A** once immediately before the manipulation and once after the cable is
 lifted. Each completed recording is written to a unique directory beneath
-`recordings/` (or `$SQUASHSIM_RECORDING_DIR`) and contains:
+`recordings/` (or `$SQUASHSIM_RECORDING_DIR`). The same A-button interval also
+captures the active SOFA viewport, including right-stick camera movement, so
+the data and video cannot be started at different times. Each episode contains:
 
 | File | Contents |
 | --- | --- |
+| `episode.mp4` | H.264 recording of exactly what the SOFA camera displayed |
+| `video_frame_timestamps.csv` | Maps each MP4 frame to sample, wall and simulation time |
 | `episode.npz` | Shape-preserving arrays for every captured channel |
 | `samples.csv` | Flat table including every deformable-object node position |
 | `metadata.json` | Configuration, schema, timing and repository/source identity |
@@ -124,6 +128,23 @@ is used for the interaction plot.
 per wall-clock second). A value near `1.0` confirms real-time execution; if the
 machine still cannot keep up, the evidence makes that explicit rather than
 guessing from the viewport.
+
+Viewport capture defaults to 15 frames per wall-clock second. This deliberately
+records the pace seen by the operator even when simulation time is advancing
+more slowly. `ffmpeg` must be available on `PATH` to produce `episode.mp4`;
+otherwise the episode data and timestamped JPEG frames are retained. Useful
+launch-time overrides are:
+
+```bash
+# Reduce capture overhead on a slower machine.
+SQUASHSIM_VIDEO_FPS=10 $RUN_SOFA -l SofaPython3 -l SofaAssimp \
+  -l ArticulatedSystemPlugin robot.py
+
+# Disable video, retain JPEGs after successful encoding, or select ffmpeg.
+SQUASHSIM_VIDEO=0
+SQUASHSIM_KEEP_VIDEO_FRAMES=1
+SQUASHSIM_FFMPEG=/usr/bin/ffmpeg
+```
 
 ## Geometry and collision
 

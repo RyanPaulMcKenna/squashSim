@@ -16,7 +16,7 @@ import numpy as np
 from episode_plots import write_episode_plots
 
 
-SCHEMA_VERSION = "squashsim-episode-v1"
+SCHEMA_VERSION = "squashsim-episode-v2"
 REPOSITORY_URL = "https://github.com/RyanPaulMcKenna/squashSim"
 DEFAULT_OUTPUT_DIRECTORY = "recordings"
 
@@ -46,6 +46,16 @@ class FrameSample:
     a_button: bool
     gripper_object_contact_count: int
     floor_object_contact_count: int
+
+
+@dataclass(frozen=True)
+class SampleTiming:
+    """Clock mapping for one sample, also used by viewport video frames."""
+
+    sample_index: int
+    sim_time_s: float
+    episode_time_s: float
+    wall_time_s: float
 
 
 def _slug(value):
@@ -176,7 +186,7 @@ class EpisodeRecorder:
 
     def record(self, sample):
         if not self.is_recording:
-            return
+            return None
         if not isinstance(sample, FrameSample):
             raise TypeError("sample must be a FrameSample")
 
@@ -220,11 +230,13 @@ class EpisodeRecorder:
         if ee_position.size != 3 or not np.isfinite(ee_position).all():
             raise ValueError("end-effector position must contain 3 finite values")
 
+        wall_time_s = max(
+            0.0, float(self.clock()) - self._start_wall_time
+        )
+        sample_index = len(self._frames)
         self._frames.append(
             {
-                "wall_time_s": max(
-                    0.0, float(self.clock()) - self._start_wall_time
-                ),
+                "wall_time_s": wall_time_s,
                 "sim_time_s": float(sample.sim_time_s),
                 "simulation_dt_s": float(sample.simulation_dt_s),
                 "joint_position_rad": joint_position.copy(),
@@ -251,6 +263,12 @@ class EpisodeRecorder:
                     0, int(sample.floor_object_contact_count)
                 ),
             }
+        )
+        return SampleTiming(
+            sample_index=sample_index,
+            sim_time_s=float(sample.sim_time_s),
+            episode_time_s=float(sample.sim_time_s) - self._start_sim_time,
+            wall_time_s=wall_time_s,
         )
 
     def _representative_index(self, node_count):
@@ -374,7 +392,7 @@ class EpisodeRecorder:
             ("controller_action", f"[{samples}]", "mixed", "Selected joint, speed, trigger delta, sticks and buttons"),
         ]
 
-    def _episode_configuration(self, arrays, identity):
+    def _episode_configuration(self, arrays, identity, video_metadata=None):
         episode_duration = max(0.0, float(arrays["episode_time_s"][-1]))
         wall_duration = max(0.0, float(arrays["wall_time_s"][-1]))
         real_time_factor = (
@@ -405,6 +423,20 @@ class EpisodeRecorder:
                 ),
             }
         )
+        if video_metadata:
+            configuration.update(
+                {
+                    "viewport video status": _configuration_entry(
+                        video_metadata.get("status", "unknown")
+                    ),
+                    "viewport video frames": _configuration_entry(
+                        video_metadata.get("frames_captured", 0), "count"
+                    ),
+                    "viewport video frame rate": _configuration_entry(
+                        video_metadata.get("encoded_frame_rate_hz"), "Hz"
+                    ),
+                }
+            )
         return configuration
 
     def _write_npz(self, directory, arrays):
@@ -518,7 +550,13 @@ class EpisodeRecorder:
             writer.writerows(rows)
 
     def _write_evidence_summary(
-        self, directory, configuration, channel_rows, identity, plot_paths
+        self,
+        directory,
+        configuration,
+        channel_rows,
+        identity,
+        plot_paths,
+        video_metadata=None,
     ):
         lines = [
             "# squashSim episode evidence",
@@ -553,6 +591,28 @@ class EpisodeRecorder:
                 f"| `{_safe_markdown(name)}` | {_safe_markdown(shape)} | "
                 f"{_safe_markdown(unit)} | {_safe_markdown(description)} |"
             )
+        if video_metadata:
+            lines.extend(
+                [
+                    "",
+                    "## Synchronized viewport video",
+                    "",
+                    (
+                        f"Status: `{_safe_markdown(video_metadata.get('status', 'unknown'))}`; "
+                        f"frames: {video_metadata.get('frames_captured', 0)}."
+                    ),
+                    "",
+                ]
+            )
+            if video_metadata.get("status") == "encoded":
+                lines.append("[Play the recorded SOFA viewport](episode.mp4)")
+                lines.append("")
+            if "video_frame_timestamps.csv" in video_metadata.get("files", []):
+                lines.append(
+                    "`video_frame_timestamps.csv` maps every video frame to "
+                    "the recorded sample, simulation time and monotonic wall time."
+                )
+                lines.append("")
         lines.extend(["", "## Plots", ""])
         for path in plot_paths:
             label = path.stem.replace("_", " ").title()
@@ -566,6 +626,19 @@ class EpisodeRecorder:
                 "- `samples.csv`: flat sample table including every object node.",
                 "- `metadata.json`: configuration, channel schema and traceability.",
                 "- `configuration.csv` and `recorded_channels.csv`: appendix-ready tables.",
+            ]
+        )
+        if video_metadata:
+            if video_metadata.get("status") == "encoded":
+                lines.append(
+                    "- `episode.mp4`: synchronized recording of the active SOFA viewport."
+                )
+            if "video_frame_timestamps.csv" in video_metadata.get("files", []):
+                lines.append(
+                    "- `video_frame_timestamps.csv`: video-frame to episode-clock mapping."
+                )
+        lines.extend(
+            [
                 "",
                 "Contact force is not exported because SOFA 25.06's Python "
                 "`ContactListener` exposes contact counts, points and elements, "
@@ -577,14 +650,24 @@ class EpisodeRecorder:
             "\n".join(lines), encoding="utf-8"
         )
 
-    def stop_and_export(self):
+    def stop_and_export(self, video_metadata=None, ended_utc=None):
         if not self.is_recording:
             return self.last_export_directory
         self.is_recording = False
         directory = self.episode_directory
+        video_metadata = dict(video_metadata or {})
+        if ended_utc is None:
+            ended_utc = datetime.now(timezone.utc)
+        ended_utc_text = (
+            ended_utc.isoformat()
+            if hasattr(ended_utc, "isoformat")
+            else str(ended_utc)
+        )
         arrays = self._arrays()
         identity = source_identity(self.project_root)
-        configuration = self._episode_configuration(arrays, identity)
+        configuration = self._episode_configuration(
+            arrays, identity, video_metadata
+        )
         channel_rows = self._channel_rows(arrays)
 
         self._write_npz(directory, arrays)
@@ -606,10 +689,18 @@ class EpisodeRecorder:
             directory, arrays, self.joint_names, self.object_label
         )
 
+        video_files = [
+            filename
+            for filename in video_metadata.get("files", [])
+            if (directory / filename.rstrip("/")).exists()
+        ]
+        if video_metadata:
+            video_metadata["files"] = video_files
+
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "recording_started_utc": self._started_utc.isoformat(),
-            "recording_ended_utc": datetime.now(timezone.utc).isoformat(),
+            "recording_ended_utc": ended_utc_text,
             "object_label": self.object_label,
             "representative_object_index": self._representative_index(
                 arrays["object_node_position_m"].shape[1]
@@ -627,6 +718,7 @@ class EpisodeRecorder:
             ],
             "contact_force_available": False,
             "source": identity,
+            "video": video_metadata or None,
             "files": [
                 "episode.npz",
                 "samples.csv",
@@ -635,6 +727,7 @@ class EpisodeRecorder:
                 "recorded_channels.csv",
                 "evidence_summary.md",
                 *[path.name for path in plot_paths],
+                *video_files,
             ],
         }
         (directory / "metadata.json").write_text(
@@ -642,7 +735,12 @@ class EpisodeRecorder:
             encoding="utf-8",
         )
         self._write_evidence_summary(
-            directory, configuration, channel_rows, identity, plot_paths
+            directory,
+            configuration,
+            channel_rows,
+            identity,
+            plot_paths,
+            video_metadata,
         )
         self.last_export_directory = directory
         return directory

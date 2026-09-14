@@ -97,8 +97,11 @@ class _Recorder:
     def __init__(self):
         self.is_recording = False
         self.last_export_directory = None
+        self.episode_directory = None
         self.frames = []
         self.starts = []
+        self.video_metadata = None
+        self.ended_utc = None
 
     @property
     def recorded_duration_s(self):
@@ -107,15 +110,54 @@ class _Recorder:
     def start(self, sim_time):
         self.starts.append(sim_time)
         self.is_recording = True
-        return Path("recordings/episode_test")
+        self.episode_directory = Path("recordings/episode_test")
+        return self.episode_directory
 
     def record(self, frame):
         self.frames.append(frame)
+        return types.SimpleNamespace(
+            sample_index=len(self.frames) - 1,
+            sim_time_s=frame.sim_time_s,
+            episode_time_s=frame.sim_time_s - self.starts[0],
+            wall_time_s=0.01 * len(self.frames),
+        )
 
-    def stop_and_export(self):
+    def stop_and_export(self, video_metadata=None, ended_utc=None):
         self.is_recording = False
+        self.video_metadata = video_metadata
+        self.ended_utc = ended_utc
         self.last_export_directory = Path("recordings/episode_test")
         return self.last_export_directory
+
+
+class _VideoRecorder:
+    def __init__(self):
+        self.enabled = True
+        self.requested_fps = 15.0
+        self.is_recording = False
+        self.capture_error = None
+        self.starts = []
+        self.frames = []
+        self.stops = 0
+
+    def start(self, directory):
+        self.starts.append(directory)
+        self.is_recording = True
+
+    def capture(self, timing):
+        self.frames.append(timing)
+        return True
+
+    def stop_and_encode(self):
+        self.is_recording = False
+        self.stops += 1
+        return {
+            "enabled": True,
+            "status": "encoded",
+            "frames_captured": len(self.frames),
+            "files": ["episode.mp4", "video_frame_timestamps.csv"],
+            "error": None,
+        }
 
 
 class _ContactListener:
@@ -146,6 +188,7 @@ class RobotGUIRecordingTests(unittest.TestCase):
             object_positions[:, 6] = 1.0
             object_dofs = _MechanicalObject(position=object_positions)
             recorder = _Recorder()
+            video_recorder = _VideoRecorder()
             controller = robot_gui.RobotGUI(
                 robot=robot,
                 articulations_mo=articulation,
@@ -153,6 +196,7 @@ class RobotGUIRecordingTests(unittest.TestCase):
                 object_mo=object_dofs,
                 root_node=root,
                 episodeRecorder=recorder,
+                videoRecorder=video_recorder,
                 gamepadBackend=_Backend(robot_gui.GamepadSample),
                 contactListeners={
                     "gripper": (_ContactListener(2), _ContactListener(1)),
@@ -172,6 +216,13 @@ class RobotGUIRecordingTests(unittest.TestCase):
 
             self.assertEqual(recorder.starts, [0.0])
             self.assertEqual(len(recorder.frames), 3)
+            self.assertEqual(video_recorder.starts, [recorder.episode_directory])
+            self.assertEqual(len(video_recorder.frames), 2)
+            self.assertEqual(video_recorder.frames[0].sample_index, 0)
+            self.assertEqual(video_recorder.frames[-1].sample_index, 1)
+            self.assertEqual(video_recorder.stops, 1)
+            self.assertEqual(recorder.video_metadata["status"], "encoded")
+            self.assertIsNotNone(recorder.ended_utc)
             self.assertFalse(recorder.is_recording)
             self.assertEqual(
                 recorder.frames[-1].gripper_object_contact_count, 3

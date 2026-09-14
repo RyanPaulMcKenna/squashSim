@@ -1,5 +1,6 @@
 """Mouse/Xbox control and synchronous recording for the UR5 + RG2."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 import time
@@ -10,6 +11,7 @@ import tkinter as tkinter
 
 from camera_controller import orbit_camera
 from episode_recorder import EpisodeRecorder, FrameSample
+from episode_video import ViewportVideoRecorder
 from xbox_controller import (
     CONTROL_LABELS,
     GamepadSample,
@@ -197,6 +199,8 @@ class RobotGUI(Sofa.Core.Controller):
         self._last_commands = expand_gui_commands(self.app.get_commands())
         self._record_stop_requested = False
         self._recording_error_reported = False
+        self._video_error_reported = False
+        self._last_recorded_timing = None
         self._camera_error_reported = False
 
         self.recorder = kwargs.get("episodeRecorder")
@@ -225,6 +229,9 @@ class RobotGUI(Sofa.Core.Controller):
                 ),
                 configuration=kwargs.get("recorderConfiguration", {}),
             )
+        self.video_recorder = kwargs.get("videoRecorder")
+        if self.video_recorder is None:
+            self.video_recorder = ViewportVideoRecorder()
 
     def _wall_control_dt(self):
         """Use elapsed real time so control speed is independent of frame rate."""
@@ -244,7 +251,15 @@ class RobotGUI(Sofa.Core.Controller):
         if self.recorder.is_recording:
             if self._record_stop_requested:
                 return "REC saving..."
-            return f"REC {self.recorder.recorded_duration_s:.1f}s | A: stop"
+            video_state = "REC+VIDEO"
+            if not getattr(self.video_recorder, "enabled", True):
+                video_state = "REC(data)"
+            elif getattr(self.video_recorder, "capture_error", None):
+                video_state = "REC(data; video error)"
+            return (
+                f"{video_state} {self.recorder.recorded_duration_s:.1f}s "
+                "| A: stop"
+            )
         if self.recorder.last_export_directory is not None:
             return (
                 "A: record | saved "
@@ -327,11 +342,43 @@ class RobotGUI(Sofa.Core.Controller):
         if self.recorder is None or not self.recorder.is_recording:
             self._record_stop_requested = False
             return
+        ended_utc = datetime.now(timezone.utc)
+        video_metadata = None
+        if self.video_recorder is not None:
+            try:
+                video_metadata = self.video_recorder.stop_and_encode()
+                if video_metadata.get("status") == "encoded":
+                    print(
+                        "[squashSim] viewport video SAVED: "
+                        f"{self.recorder.episode_directory / 'episode.mp4'}"
+                    )
+                elif video_metadata.get("enabled"):
+                    print(
+                        "[squashSim] viewport video not encoded: "
+                        f"{video_metadata.get('error', 'unknown error')}"
+                    )
+            except Exception as error:
+                video_metadata = {
+                    "enabled": True,
+                    "status": "failed",
+                    "files": [],
+                    "error": str(error),
+                }
+                print(f"[squashSim] viewport video export FAILED: {error}")
         try:
-            output_directory = self.recorder.stop_and_export()
+            output_directory = self.recorder.stop_and_export(
+                video_metadata=video_metadata,
+                ended_utc=ended_utc,
+            )
             print(f"[squashSim] recording SAVED: {output_directory}")
+            video_evidence = (
+                "episode.mp4, "
+                if video_metadata
+                and video_metadata.get("status") == "encoded"
+                else ""
+            )
             print(
-                "[squashSim] evidence: episode.npz, samples.csv, "
+                f"[squashSim] evidence: {video_evidence}timestamped data, "
                 "metadata/tables and SVG plots"
             )
         except Exception as error:
@@ -376,6 +423,27 @@ class RobotGUI(Sofa.Core.Controller):
                 )
                 self._record_stop_requested = False
                 self._recording_error_reported = False
+                self._video_error_reported = False
+                self._last_recorded_timing = None
+                if self.video_recorder is not None:
+                    try:
+                        self.video_recorder.start(output_directory)
+                        if self.video_recorder.is_recording:
+                            print(
+                                "[squashSim] viewport video START: "
+                                f"{self.video_recorder.requested_fps:.3g} fps"
+                            )
+                        elif getattr(self.video_recorder, "enabled", True):
+                            print(
+                                "[squashSim] viewport video unavailable; "
+                                "data recording continues: "
+                                f"{self.video_recorder.capture_error}"
+                            )
+                    except Exception as error:
+                        print(
+                            "[squashSim] viewport video unavailable; "
+                            f"data recording continues: {error}"
+                        )
                 print(f"[squashSim] recording START: {output_directory}")
 
         speed_name, speed = SPEED_PRESETS[update.speed_index]
@@ -405,11 +473,42 @@ class RobotGUI(Sofa.Core.Controller):
         if self.recorder is None or not self.recorder.is_recording:
             return
         try:
-            self.recorder.record(self._capture_frame())
+            timing = self.recorder.record(self._capture_frame())
         except Exception as error:
+            timing = None
             if not self._recording_error_reported:
                 print(f"[squashSim] recording sample FAILED: {error}")
                 self._recording_error_reported = True
+
+        # SOFA redraws after AnimateEndEvent. The framebuffer visible here is
+        # therefore the preceding completed sample, retained explicitly so
+        # each saved image is mapped to the state it actually displays.
+        displayed_timing = self._last_recorded_timing
+        if timing is not None:
+            self._last_recorded_timing = timing
+        if (
+            displayed_timing is not None
+            and self.video_recorder is not None
+            and self.video_recorder.is_recording
+        ):
+            try:
+                self.video_recorder.capture(displayed_timing)
+                video_error = getattr(
+                    self.video_recorder, "capture_error", None
+                )
+                if video_error and not self._video_error_reported:
+                    print(
+                        "[squashSim] viewport capture FAILED; "
+                        f"data recording continues: {video_error}"
+                    )
+                    self._video_error_reported = True
+            except Exception as error:
+                if not self._video_error_reported:
+                    print(
+                        "[squashSim] viewport capture FAILED; "
+                        f"data recording continues: {error}"
+                    )
+                    self._video_error_reported = True
         if self._record_stop_requested:
             self._finish_recording()
 

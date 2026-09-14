@@ -74,7 +74,24 @@ class EpisodeRecorderTests(unittest.TestCase):
             recorder.record(_frame(0, 0))
             recorder.record(_frame(1, 2))
             recorder.record(_frame(2, 0))
-            output = recorder.stop_and_export()
+            (recorder.episode_directory / "episode.mp4").write_bytes(b"video")
+            (recorder.episode_directory / "video_frame_timestamps.csv").write_text(
+                "video_frame_index,sample_index\n0,0\n", encoding="utf-8"
+            )
+            output = recorder.stop_and_export(
+                video_metadata={
+                    "enabled": True,
+                    "status": "encoded",
+                    "frames_captured": 1,
+                    "encoded_frame_rate_hz": 15.0,
+                    "files": [
+                        "episode.mp4",
+                        "video_frame_timestamps.csv",
+                    ],
+                    "error": None,
+                },
+                ended_utc="2026-09-14T20:00:03+00:00",
+            )
 
             expected_files = {
                 "episode.npz",
@@ -86,6 +103,8 @@ class EpisodeRecorderTests(unittest.TestCase):
                 "height_vs_time.svg",
                 "contact_activity.svg",
                 "joint_positions.svg",
+                "episode.mp4",
+                "video_frame_timestamps.csv",
             }
             self.assertTrue(expected_files.issubset({p.name for p in output.iterdir()}))
 
@@ -110,8 +129,14 @@ class EpisodeRecorderTests(unittest.TestCase):
             metadata = json.loads(
                 (output / "metadata.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(metadata["schema_version"], "squashsim-episode-v1")
+            self.assertEqual(metadata["schema_version"], "squashsim-episode-v2")
+            self.assertEqual(
+                metadata["recording_ended_utc"],
+                "2026-09-14T20:00:03+00:00",
+            )
             self.assertEqual(metadata["representative_object_index"], 1)
+            self.assertEqual(metadata["video"]["status"], "encoded")
+            self.assertIn("episode.mp4", metadata["files"])
             self.assertIn("implementation_id", metadata["source"])
             self.assertAlmostEqual(
                 metadata["configuration"]["real-time factor"]["value"],
